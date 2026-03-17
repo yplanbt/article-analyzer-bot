@@ -26,6 +26,26 @@ def _get_secret(key: str, default: str = "") -> str:
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Article Analyzer Bot", page_icon="📰", layout="wide")
+
+# ── Password protection ──────────────────────────────────────────────────────
+APP_PASSWORD = _get_secret("APP_PASSWORD", "")
+
+if APP_PASSWORD:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔒 Article Analyzer Bot")
+        st.markdown("Enter the password to access this app.")
+        password_input = st.text_input("Password", type="password")
+        if st.button("Login", type="primary"):
+            if password_input == APP_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        st.stop()
+
 st.title("📰 Article Analyzer Bot")
 st.caption("Analyzes news articles: duplicate check, same-day arrest, FOIA score, YouTube score.")
 
