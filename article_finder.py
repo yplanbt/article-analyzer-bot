@@ -94,7 +94,7 @@ def build_search_queries(
     if state and not city and not county and not police_dept:
         location_parts.append(f'"{state}"')
 
-    location_str = " OR ".join(location_parts) if location_parts else f'"{state}"'
+    location_str = " OR ".join(location_parts) if location_parts else ""
 
     # Gender keyword
     gender_term = ""
@@ -119,12 +119,18 @@ def build_search_queries(
     if all_charge_groups:
         for terms in all_charge_groups:
             charge_str = " OR ".join(f'"{t}"' for t in terms)
-            q = f'"arrested" ({charge_str}) ({location_str})'
+            if location_str:
+                q = f'"arrested" ({charge_str}) ({location_str})'
+            else:
+                q = f'"arrested" ({charge_str})'
             if gender_term:
                 q = f'{gender_term} {q}'
             queries.append(q)
     else:
-        q = f'"arrested" "charged" ({location_str})'
+        if location_str:
+            q = f'"arrested" "charged" ({location_str})'
+        else:
+            q = f'"arrested" "charged"'
         if gender_term:
             q = f'{gender_term} {q}'
         queries.append(q)
@@ -156,6 +162,24 @@ def _parse_serp_date(date_str: str) -> datetime | None:
     return None
 
 
+def _extract_date_from_url(url: str) -> datetime | None:
+    """Try to extract a date from the URL path (many news sites embed dates)."""
+    # Match patterns like /2026/03/05/ or /2026-03-05/
+    match = re.search(r'/(\d{4})/(\d{1,2})/(\d{1,2})/', url)
+    if match:
+        try:
+            return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            pass
+    match = re.search(r'/(\d{4})-(\d{1,2})-(\d{1,2})/', url)
+    if match:
+        try:
+            return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
 def _extract_articles_from_results(
     news_results: list,
     seen_urls: set,
@@ -176,18 +200,29 @@ def _extract_articles_from_results(
         seen_urls.add(link)
         pub_date = _parse_serp_date(item.get("date", ""))
 
+        # Also try to extract date from URL as fallback/cross-check
+        url_date = _extract_date_from_url(link)
+
+        # Use the best available date — prefer SerpAPI date, fallback to URL date
+        best_date = pub_date or url_date
+
         # Strict date filtering — skip articles outside the date range
-        if pub_date and date_from and pub_date.date() < date_from.date():
+        if best_date and date_from and best_date.date() < date_from.date():
             continue
-        if pub_date and date_to and pub_date.date() > date_to.date():
+        if best_date and date_to and best_date.date() > date_to.date():
             continue
+
+        # If we have a URL date that contradicts, use URL date (more reliable for year)
+        if url_date and date_from:
+            if url_date.year < date_from.year:
+                continue
 
         articles.append({
             "title": item.get("title", ""),
             "url": link,
             "source": item.get("source", {}).get("name", "") if isinstance(item.get("source"), dict) else str(item.get("source", "")),
             "snippet": item.get("snippet", ""),
-            "date": pub_date,
+            "date": best_date,
             "date_str": item.get("date", ""),
         })
     return articles

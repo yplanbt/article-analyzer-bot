@@ -16,13 +16,16 @@ TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.jso
 CLIENT_SECRET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_secret.json")
 
 
-def get_sheets_service(client_secret_path: str = CLIENT_SECRET_PATH):
-    """Authenticate via OAuth2 and return a Google Sheets API service.
+_cached_creds = None
 
-    Supports two modes:
-    1. Streamlit Cloud: reads token from st.secrets["GOOGLE_TOKEN"]
-    2. Local: reads token.json / client_secret.json from disk
-    """
+
+def _get_creds(client_secret_path: str = CLIENT_SECRET_PATH):
+    """Get OAuth2 credentials, caching them for reuse by both Sheets and Drive."""
+    global _cached_creds
+
+    if _cached_creds and _cached_creds.valid:
+        return _cached_creds
+
     creds = None
 
     # Mode 1: Streamlit Cloud (secrets-based)
@@ -33,7 +36,8 @@ def get_sheets_service(client_secret_path: str = CLIENT_SECRET_PATH):
             creds = Credentials.from_authorized_user_info(token_data, SCOPES)
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-            return build("sheets", "v4", credentials=creds)
+            _cached_creds = creds
+            return creds
     except Exception:
         pass
 
@@ -55,6 +59,13 @@ def get_sheets_service(client_secret_path: str = CLIENT_SECRET_PATH):
         with open(TOKEN_PATH, "w") as f:
             f.write(creds.to_json())
 
+    _cached_creds = creds
+    return creds
+
+
+def get_sheets_service(client_secret_path: str = CLIENT_SECRET_PATH):
+    """Authenticate via OAuth2 and return a Google Sheets API service."""
+    creds = _get_creds(client_secret_path)
     return build("sheets", "v4", credentials=creds)
 
 
@@ -170,10 +181,8 @@ def create_new_sheet(service, title: str, make_public: bool = True) -> str:
 
     if make_public:
         try:
-            from googleapiclient.discovery import build as build_service
-            # Build Drive service using same credentials
-            creds = service._http.credentials
-            drive = build_service("drive", "v3", credentials=creds)
+            creds = _get_creds()
+            drive = build("drive", "v3", credentials=creds)
             drive.permissions().create(
                 fileId=sheet_id,
                 body={
@@ -182,9 +191,10 @@ def create_new_sheet(service, title: str, make_public: bool = True) -> str:
                 },
                 fields="id",
             ).execute()
-        except Exception:
-            # If Drive permissions fail, still return the sheet
-            pass
+        except Exception as e:
+            # Log but don't fail
+            import sys
+            print(f"Warning: Could not make sheet public: {e}", file=sys.stderr)
 
     return sheet_id
 

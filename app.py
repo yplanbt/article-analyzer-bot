@@ -360,7 +360,9 @@ with tab_finder:
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            finder_state = st.selectbox("State", US_STATES, index=US_STATES.index("Ohio"))
+            state_options = ["All States"] + US_STATES
+            finder_state_selection = st.selectbox("State", state_options, index=0)
+            finder_state = "" if finder_state_selection == "All States" else finder_state_selection
             finder_city = st.text_input("City", placeholder="e.g. Canton")
 
         with col2:
@@ -595,7 +597,7 @@ with tab_finder:
             st.dataframe(final_df, use_container_width=True, hide_index=True, height=400)
 
             # Build descriptive sheet name
-            name_parts = [finder_state]
+            name_parts = [finder_state if finder_state else "All States"]
             if finder_city:
                 name_parts.append(finder_city)
             elif finder_county:
