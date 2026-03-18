@@ -126,35 +126,79 @@ def get_youtube_transcript(video_id: str) -> str:
 
 
 def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
-    """Use Gemini to analyze the video content — understands both audio and visuals."""
-    import google.generativeai as genai
-
-    genai.configure(api_key=gemini_key)
+    """Use Gemini to analyze the actual video file — downloads, uploads to Gemini, gets real analysis."""
+    from google import genai
+    import subprocess
+    import tempfile
+    import os
+    import time
 
     # Extract video ID
     video_id = extract_video_id(video_url)
     if not video_id:
         return {"error": "Invalid YouTube URL"}
 
-    # Get transcript as fallback/supplement
-    transcript = get_youtube_transcript(video_id)
+    client = genai.Client(api_key=gemini_key)
 
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    # Step 1: Download video with yt-dlp (lowest quality to save time/bandwidth)
+    tmp_path = tempfile.mktemp(suffix='.mp4')
+    try:
+        dl_result = subprocess.run(
+            ['yt-dlp', '-f', 'worst[ext=mp4]', '-o', tmp_path,
+             f'https://www.youtube.com/watch?v={video_id}'],
+            capture_output=True, text=True, timeout=300
+        )
+        if not os.path.exists(tmp_path):
+            # Fallback: try without format filter
+            subprocess.run(
+                ['yt-dlp', '-f', 'mp4', '-o', tmp_path,
+                 f'https://www.youtube.com/watch?v={video_id}'],
+                capture_output=True, text=True, timeout=300
+            )
+    except subprocess.TimeoutExpired:
+        return {"error": "Video download timed out (5 min limit)"}
+    except FileNotFoundError:
+        return {"error": "yt-dlp is not installed"}
 
-    prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation purposes.
+    if not os.path.exists(tmp_path):
+        return {"error": f"Failed to download video: {dl_result.stderr[:200]}"}
 
-VIDEO URL: {video_url}
+    file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
 
-TRANSCRIPT:
-{transcript}
+    # Step 2: Upload to Gemini Files API
+    try:
+        uploaded = client.files.upload(file=tmp_path)
 
-Analyze this video and provide a detailed breakdown:
+        # Wait for processing (Gemini needs to process the video)
+        wait_start = time.time()
+        while uploaded.state.name == 'PROCESSING':
+            if time.time() - wait_start > 300:  # 5 min timeout
+                return {"error": "Gemini video processing timed out"}
+            time.sleep(3)
+            uploaded = client.files.get(name=uploaded.name)
 
-1. **WHAT HAPPENED** — Describe the full incident in detail. Who was involved? What was the crime? What did police do? How did it escalate? How did it end?
+        if uploaded.state.name != 'ACTIVE':
+            return {"error": f"Gemini file state: {uploaded.state.name}"}
 
-2. **KEY DRAMATIC MOMENTS** — What are the most shocking, tense, or emotionally charged moments? What would make someone click on this video?
+    except Exception as e:
+        return {"error": f"Gemini upload failed: {e}"}
+    finally:
+        # Clean up downloaded file
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
-3. **PEOPLE INVOLVED** — Describe each person: their role (suspect, officer, victim, bystander), approximate age, gender, behavior, attitude (entitled, aggressive, calm, panicking, etc.)
+    # Step 3: Analyze the actual video with Gemini
+    prompt = """You are analyzing a bodycam/crime YouTube video for title generation. Watch the ENTIRE video carefully.
+
+BE EXTREMELY ACCURATE. Only describe what you actually see and hear. Do NOT make anything up.
+
+Provide a detailed breakdown:
+
+1. **WHAT HAPPENED** — Describe the full incident in detail. Who was involved (use real names if mentioned)? What was the crime? What did police do? How did it escalate? How did it end?
+
+2. **KEY DRAMATIC MOMENTS** — What are the most shocking, tense, or emotionally charged moments? Include timestamps if possible.
+
+3. **PEOPLE INVOLVED** — Describe each person: their role (suspect, officer, victim, bystander), name if mentioned, approximate age, gender, behavior, attitude (entitled, aggressive, calm, panicking, etc.)
 
 4. **SEVERITY LEVEL** — On a scale of 1-10, how shocking/intense is this incident? Why?
 
@@ -164,21 +208,30 @@ Analyze this video and provide a detailed breakdown:
    - What makes this different from typical bodycam videos?
    - What emotional reaction will viewers have?
 
-6. **SIMILAR TO** — What type of viral bodycam content does this remind you of? (e.g., "entitled Karen gets arrested", "routine traffic stop goes wrong", "suspect doesn't realize they're caught")
+6. **SIMILAR TO** — What type of viral bodycam content does this remind you of?
 
 Return your analysis as JSON:
-{{"what_happened": "...", "key_moments": ["...", "..."], "people": [{{"role": "...", "description": "..."}}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}}
+{"what_happened": "...", "key_moments": ["...", "..."], "people": [{"role": "...", "description": "..."}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}
 """
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[uploaded, prompt]
+        )
         raw = response.text.strip()
+
+        # Clean up the uploaded file from Gemini
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
 
         # Parse JSON
         json_match = re.search(r'\{[\s\S]*\}', raw)
         if json_match:
             return json.loads(json_match.group())
-        return {"error": f"No JSON in response", "raw": raw[:500]}
+        return {"error": f"No JSON in Gemini response", "raw": raw[:500]}
     except Exception as e:
         return {"error": str(e)}
 
