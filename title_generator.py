@@ -222,20 +222,44 @@ Return ONLY valid JSON:
 """
 
 
+def _call_gemini_rest(api_key: str, prompt: str) -> dict:
+    """Call Gemini API directly via REST, bypassing SDK issues."""
+    import requests as req
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    resp = req.post(url, json=payload, timeout=120)
+
+    if resp.status_code != 200:
+        # Try v1 endpoint as fallback
+        url_v1 = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key={api_key}"
+        resp = req.post(url_v1, json=payload, timeout=120)
+        if resp.status_code != 200:
+            # Try gemini-1.5-flash as last resort
+            url_fallback = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
+            resp = req.post(url_fallback, json=payload, timeout=120)
+            if resp.status_code != 200:
+                return {"error": f"{resp.status_code}: {resp.text[:500]}"}
+
+    data = resp.json()
+    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    json_match = re.search(r'\{[\s\S]*\}', raw)
+    if json_match:
+        return json.loads(json_match.group())
+    return {"error": "No JSON in Gemini response", "raw": raw[:500]}
+
+
 def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str = None) -> dict:
     """Analyze video using transcript + metadata with strict accuracy prompting.
 
     Tries youtube-transcript-api first. If that fails (e.g. cloud IP blocked),
-    falls back to Gemini's native YouTube URL understanding.
+    falls back to metadata-only analysis.
     """
-    from google import genai
-
     video_id = extract_video_id(video_url)
     if not video_id:
         return {"error": "Invalid YouTube URL"}
 
     metadata = _get_video_metadata(video_id, youtube_key) if youtube_key else {}
-    client = genai.Client(api_key=gemini_key)
 
     # Try getting transcript via library first
     transcript = get_youtube_transcript(video_id)
@@ -245,34 +269,24 @@ def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str 
         # Have transcript — send as text
         prompt = _build_analysis_prompt(transcript, metadata)
         try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-            )
-            raw = response.text.strip()
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                return json.loads(json_match.group())
-            return {"error": "No JSON in Gemini response", "raw": raw[:500]}
+            return _call_gemini_rest(gemini_key, prompt)
         except Exception as e:
             return {"error": str(e)}
     else:
-        # Transcript library blocked — let Gemini process the YouTube URL directly
-        from google.genai import types
-
+        # Transcript library blocked — analyze using metadata only
         fallback_prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation.
 
-Watch this video carefully. Focus on the DIALOGUE and what people say.
+Based on the metadata below, provide your best analysis.
 
 VIDEO METADATA:
 - Original title: {metadata.get('title', 'Unknown')}
 - Channel: {metadata.get('channel', 'Unknown')}
 - Description: {metadata.get('description', 'N/A')[:500]}
 
-Based on the video, provide:
+Based on the metadata, provide:
 
 1. **WHAT HAPPENED** — Full incident description. Names, charges, what police did, how it ended.
-2. **KEY DRAMATIC MOMENTS** — Most shocking/tense moments. Quote exact words from dialogue.
+2. **KEY DRAMATIC MOMENTS** — Most shocking/tense moments based on what's described.
 3. **PEOPLE INVOLVED** — Each person: role, name if stated, gender, age if mentioned, behavior/attitude.
 4. **SEVERITY** — 1-10 based on what happened.
 5. **CLICKBAIT ANGLES** — What aspects drive the most curiosity?
@@ -282,25 +296,7 @@ Return ONLY valid JSON:
 {{"what_happened": "...", "key_moments": ["...", "..."], "people": [{{"role": "...", "description": "..."}}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}}
 """
         try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[
-                    types.Content(
-                        parts=[
-                            types.Part.from_uri(
-                                file_uri=f"https://www.youtube.com/watch?v={video_id}",
-                                mime_type="video/*",
-                            ),
-                            types.Part.from_text(text=fallback_prompt),
-                        ]
-                    )
-                ],
-            )
-            raw = response.text.strip()
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                return json.loads(json_match.group())
-            return {"error": "No JSON in Gemini response", "raw": raw[:500]}
+            return _call_gemini_rest(gemini_key, fallback_prompt)
         except Exception as e:
             return {"error": str(e)}
 
