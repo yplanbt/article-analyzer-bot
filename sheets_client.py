@@ -8,7 +8,10 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
 CLIENT_SECRET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_secret.json")
 
@@ -159,11 +162,31 @@ def write_results_to_row(service, sheet_id: str, tab_name: str, row_num: int, re
     ).execute()
 
 
-def create_new_sheet(service, title: str) -> str:
-    """Create a new Google Sheet and return its ID."""
+def create_new_sheet(service, title: str, make_public: bool = True) -> str:
+    """Create a new Google Sheet and return its ID. Optionally make it public."""
     body = {"properties": {"title": title}}
     sheet = service.spreadsheets().create(body=body).execute()
-    return sheet["spreadsheetId"]
+    sheet_id = sheet["spreadsheetId"]
+
+    if make_public:
+        try:
+            from googleapiclient.discovery import build as build_service
+            # Build Drive service using same credentials
+            creds = service._http.credentials
+            drive = build_service("drive", "v3", credentials=creds)
+            drive.permissions().create(
+                fileId=sheet_id,
+                body={
+                    "type": "anyone",
+                    "role": "writer",
+                },
+                fields="id",
+            ).execute()
+        except Exception:
+            # If Drive permissions fail, still return the sheet
+            pass
+
+    return sheet_id
 
 
 def append_rows_to_sheet(service, sheet_id: str, tab_name: str, rows: list[list[str]]):

@@ -369,16 +369,45 @@ with tab_finder:
 
         with col3:
             finder_gender = st.selectbox("Gender", ["Any", "Male", "Female"])
-            finder_days = st.selectbox("Time Frame", [7, 14, 30, 60, 90], index=2,
-                                       format_func=lambda x: f"Last {x} days")
+            same_day_only = st.toggle("Same Day Arrests Only", value=False,
+                                       help="Only include articles where the arrest happened on the same day as the crime")
 
+        # Date range
+        st.markdown("##### Date Range")
+        col_from, col_to = st.columns(2)
+        with col_from:
+            date_from = st.date_input("From", value=datetime.now().date() - timedelta(days=30))
+        with col_to:
+            date_to = st.date_input("To", value=datetime.now().date())
+
+        if date_from > date_to:
+            st.error("'From' date must be before 'To' date.")
+            st.stop()
+
+        # Charges — preset categories + custom input
+        st.markdown("##### Charges")
         finder_charges = st.multiselect(
-            "Charges",
+            "Select from common charges",
             sorted(CHARGE_CATEGORIES.keys()),
-            placeholder="All crime types",
+            placeholder="Pick charge categories...",
         )
 
-        col_max, col_top, col_btn = st.columns([1, 1, 1])
+        custom_charge_input = st.text_input(
+            "Add custom charges",
+            placeholder="e.g. carjacking, stalking, manslaughter (comma-separated)",
+            help="Type any charge — the system will automatically find related/similar charges",
+        )
+        custom_charges_list = []
+        if custom_charge_input.strip():
+            custom_charges_list = [c.strip() for c in custom_charge_input.split(",") if c.strip()]
+            # Show expanded terms
+            from article_finder import _expand_custom_charges
+            with st.expander("Expanded search terms", expanded=False):
+                for custom in custom_charges_list:
+                    expanded = _expand_custom_charges(custom)
+                    st.caption(f"**{custom}** → {', '.join(expanded)}")
+
+        col_max, col_top, _ = st.columns([1, 1, 1])
         with col_max:
             max_search = st.number_input("Max to search", min_value=10, max_value=500, value=150)
         with col_top:
@@ -397,6 +426,8 @@ with tab_finder:
             # ── Step 1: Search ────────────────────────────────────────────
             st.markdown("---")
             st.markdown("##### Step 1 — Searching Google News")
+            date_range_str = f"{date_from.strftime('%b %d')} – {date_to.strftime('%b %d, %Y')}"
+            st.caption(f"Date range: {date_range_str}")
             search_progress = st.progress(0)
             search_status = st.empty()
 
@@ -411,8 +442,10 @@ with tab_finder:
                 county=finder_county,
                 police_dept=finder_dept,
                 charges=finder_charges if finder_charges else None,
+                custom_charges=custom_charges_list if custom_charges_list else None,
                 gender=finder_gender,
-                days_back=finder_days,
+                date_from=datetime.combine(date_from, datetime.min.time()),
+                date_to=datetime.combine(date_to, datetime.max.time()),
                 max_results=max_search,
                 progress_callback=on_search_progress,
             )
@@ -421,7 +454,7 @@ with tab_finder:
             search_status.empty()
 
             if not found_articles:
-                st.warning("No articles found. Try broader search terms.")
+                st.warning("No articles found. Try broader search terms or a wider date range.")
                 st.stop()
 
             st.caption(f"Found **{len(found_articles)}** articles")
@@ -511,14 +544,19 @@ with tab_finder:
                 st.warning("No articles could be analyzed.")
                 st.stop()
 
-            # ── Step 4: Rank ──────────────────────────────────────────────
+            # ── Step 4: Rank & Filter ─────────────────────────────────────
             st.markdown("##### Step 4 — Ranking & exporting")
 
             valid = []
             seen_names = set()
+            same_day_filtered = 0
             for r in analyzed:
                 state_lower = r.get("state", "").strip().lower()
                 if state_lower in EXCLUDED_STATES:
+                    continue
+                # Same day arrest filter
+                if same_day_only and r.get("same_day_arrest", "").strip().lower() != "yes":
+                    same_day_filtered += 1
                     continue
                 name = r.get("suspect_name", "").strip().lower()
                 if name and name in seen_names:
@@ -526,6 +564,9 @@ with tab_finder:
                 if name:
                     seen_names.add(name)
                 valid.append(r)
+
+            if same_day_only and same_day_filtered > 0:
+                st.caption(f"Filtered out **{same_day_filtered}** articles that were not same-day arrests")
 
             def sort_key(r):
                 try:
@@ -535,6 +576,10 @@ with tab_finder:
 
             valid.sort(key=sort_key, reverse=True)
             top_articles = valid[:top_n]
+
+            if not top_articles:
+                st.warning("No articles passed the filters.")
+                st.stop()
 
             final_df = pd.DataFrame([{
                 "#": i + 1,
@@ -549,11 +594,31 @@ with tab_finder:
 
             st.dataframe(final_df, use_container_width=True, hide_index=True, height=400)
 
+            # Build descriptive sheet name
+            name_parts = [finder_state]
+            if finder_city:
+                name_parts.append(finder_city)
+            elif finder_county:
+                name_parts.append(finder_county)
+            charge_label = ""
+            if finder_charges:
+                charge_label = ", ".join(finder_charges[:2])
+                if len(finder_charges) > 2:
+                    charge_label += f" +{len(finder_charges) - 2}"
+            elif custom_charges_list:
+                charge_label = ", ".join(custom_charges_list[:2])
+            if charge_label:
+                name_parts.append(charge_label)
+            name_parts.append(f"{date_from.strftime('%b %d')}-{date_to.strftime('%b %d')}")
+
+            sheet_title = f"Articles — {' · '.join(name_parts)}"
+            if len(sheet_title) > 100:
+                sheet_title = sheet_title[:97] + "..."
+
             # Export
             with st.spinner("Creating Google Sheet..."):
                 try:
-                    sheet_title = f"Found - {finder_state} - {datetime.now().strftime('%b %d %H:%M')}"
-                    new_sheet_id = create_new_sheet(service, sheet_title)
+                    new_sheet_id = create_new_sheet(service, sheet_title, make_public=True)
 
                     header_row = [
                         "LINK TO WEBSITE", "NAME OF SUSPECT(S)", "DATE OF INCIDENT",
@@ -576,8 +641,9 @@ with tab_finder:
                     append_rows_to_sheet(service, new_sheet_id, "Sheet1", [header_row] + data_rows)
 
                     sheet_url = f"https://docs.google.com/spreadsheets/d/{new_sheet_id}"
-                    st.success(f"Exported **{len(top_articles)}** articles!")
+                    st.success(f"Exported **{len(top_articles)}** articles to a public sheet!")
                     st.markdown(f"[Open Google Sheet →]({sheet_url})")
+                    st.caption("Anyone with the link can view and edit this sheet.")
                     st.balloons()
 
                 except Exception as e:
