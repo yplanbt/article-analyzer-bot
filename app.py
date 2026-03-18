@@ -329,7 +329,7 @@ def test_anthropic_key(key):
     try:
         client = _anthropic.Anthropic(api_key=key)
         client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=5,
+            model="claude-sonnet-4-6-20250627", max_tokens=5,
             messages=[{"role": "user", "content": "Say OK"}],
         )
         return True, ""

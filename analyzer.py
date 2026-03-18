@@ -190,7 +190,7 @@ def analyze_found_article(api_key: str, article: dict, search_state: str = "",
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6-20250627",
             max_tokens=1024,
             temperature=0,
             messages=[{"role": "user", "content": prompt}],
@@ -252,7 +252,7 @@ def analyze_article(api_key: str, article: dict, sheet_row: dict = None) -> dict
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6-20250627",
             max_tokens=1024,
             temperature=0,
             messages=[{"role": "user", "content": prompt}],

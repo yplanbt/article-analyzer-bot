@@ -125,7 +125,7 @@ def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
     # Get transcript as fallback/supplement
     transcript = get_youtube_transcript(video_id)
 
-    model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
     prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation purposes.
 
@@ -315,7 +315,7 @@ Return ONLY valid JSON array:
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6-20250627",
             max_tokens=2048,
             temperature=0.8,  # Higher temp for creative variety
             messages=[{"role": "user", "content": prompt}],
