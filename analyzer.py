@@ -109,6 +109,122 @@ Example format:
 """
 
 
+FINDER_PROMPT = """\
+You are an expert crime/law enforcement news analyst. Read this article carefully and extract all key details.
+
+═══════════════════════════════════════
+ARTICLE
+═══════════════════════════════════════
+Title: {title}
+URL: {url}
+Article publish date: {publish_date}
+Search context: Looking for crimes in {search_state}, {search_city} {search_county}
+
+═══════════════════════════════════════
+ARTICLE TEXT
+═══════════════════════════════════════
+{text}
+
+═══════════════════════════════════════
+EXTRACTION TASKS
+═══════════════════════════════════════
+
+1. SUSPECT NAME — Extract the full name of the person arrested. If multiple suspects, separate with " / ". If no name found, say "Unknown".
+
+2. INCIDENT DATE — The date the crime/incident occurred (NOT the arrest date, NOT the publish date). Format: "Month Day, Year" (e.g. "March 4, 2026"). If unclear, use your best estimate from context.
+
+3. ARREST DATE — The date the suspect was arrested. Format: "Month Day, Year".
+
+4. POLICE DEPARTMENT — The law enforcement agency that made the arrest or is handling the case. Full name.
+
+5. STATE — The US state where this happened. Full name (e.g. "Ohio", not "OH").
+
+6. SAME DAY ARREST — Did the arrest happen on the same calendar day as the crime/incident?
+   - Compare the CRIME/INCIDENT date (when the crime happened) vs the ARREST date (when they were arrested)
+   - If police responded to a crime AND arrested the suspect during that same response/pursuit → "Yes"
+   - If everything described is one continuous same-day event → "Yes"
+   - If crime was Day 1 but arrest was Day 2+ → "No"
+   - Only say "Unclear" if you genuinely cannot determine either date
+
+7. FOIA SCORE (0-10) — Rate suitability for a FOIA request:
+   - +3 for specific incident date AND location mentioned
+   - +3 for police department clearly named
+   - +2 for real narrative with specific details
+   - +2 for enough identifying info to file a request
+   - EXCLUDED STATES get automatic 0: {excluded_states}
+   - If the state is NOT in the excluded list, NEVER give 0
+
+8. YOUTUBE SCORE (1-10) — Rate viral/YouTube potential based on severity:
+   - 8-10: child abuse/murder, officer shootings, deaths in custody, serial crimes, mass incidents
+   - 5-7: armed robbery with pursuit, serious assault, drug trafficking, kidnapping, standoffs
+   - 3-4: simple DUI, low-value shoplifting, minor possession, routine warrants
+   - 1-2: traffic violations, minor misdemeanors, paperwork crimes
+
+═══════════════════════════════════════
+RESPONSE FORMAT
+═══════════════════════════════════════
+Return ONLY valid JSON:
+{{"suspect_name": "...", "incident_date": "...", "arrest_date": "...", "police_dept": "...", "state": "...", "same_day_arrest": "Yes/No/Unclear", "foia_score": 8, "youtube_score": 5}}
+"""
+
+
+def analyze_found_article(api_key: str, article: dict, search_state: str = "",
+                          search_city: str = "", search_county: str = "") -> dict:
+    """Analyze a found article — extracts suspect name, dates, scores. Used by Article Finder."""
+    publish_date_str = "Unknown"
+    if article.get("publish_date"):
+        publish_date_str = article["publish_date"].strftime("%B %d, %Y")
+
+    prompt = FINDER_PROMPT.format(
+        title=article.get("title", "Unknown"),
+        publish_date=publish_date_str,
+        url=article.get("url", ""),
+        text=article.get("text", "No text available"),
+        search_state=search_state,
+        search_city=search_city,
+        search_county=search_county,
+        excluded_states=", ".join(sorted(EXCLUDED_STATES)),
+    )
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+
+        json_match = re.search(r'\{[\s\S]*\}', raw)
+        if json_match:
+            result = json.loads(json_match.group())
+        else:
+            return {"error": f"No JSON found: {raw[:200]}"}
+
+        # Enforce excluded state rule
+        state_lower = result.get("state", "").strip().lower()
+        if state_lower in EXCLUDED_STATES:
+            result["foia_score"] = 0
+        elif result.get("foia_score") == 0:
+            result["foia_score"] = 1
+
+        try:
+            result["foia_score"] = int(result["foia_score"])
+        except (ValueError, TypeError):
+            pass
+        try:
+            result["youtube_score"] = int(result["youtube_score"])
+        except (ValueError, TypeError):
+            pass
+
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def analyze_article(api_key: str, article: dict, sheet_row: dict = None) -> dict:
     """Send article to Claude for analysis. Returns parsed result dict."""
     if not sheet_row:

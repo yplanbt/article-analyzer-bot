@@ -157,3 +157,20 @@ def write_results_to_row(service, sheet_id: str, tab_name: str, row_num: int, re
         valueInputOption="RAW",
         body={"values": [values]},
     ).execute()
+
+
+def create_new_sheet(service, title: str) -> str:
+    """Create a new Google Sheet and return its ID."""
+    body = {"properties": {"title": title}}
+    sheet = service.spreadsheets().create(body=body).execute()
+    return sheet["spreadsheetId"]
+
+
+def append_rows_to_sheet(service, sheet_id: str, tab_name: str, rows: list[list[str]]):
+    """Write rows to a sheet starting from A1."""
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab_name}!A1",
+        valueInputOption="RAW",
+        body={"values": rows},
+    ).execute()
