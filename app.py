@@ -18,7 +18,7 @@ from analyzer import analyze_article, analyze_found_article, EXCLUDED_STATES
 from article_finder import search_articles, CHARGE_CATEGORIES
 from title_generator import (
     extract_video_id, get_youtube_transcript, analyze_video_with_gemini,
-    search_similar_videos, generate_titles, TOP_PERFORMING_TITLES,
+    search_similar_videos, generate_titles,
 )
 
 load_dotenv()
@@ -918,10 +918,6 @@ with tab_analyzer:
 # TAB 3: TITLE GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_titles:
-    if is_cloud:
-        st.warning("**Title Generator requires localhost.** It downloads and uploads the actual video to Gemini for accurate visual analysis. Run the app locally: `streamlit run app.py`")
-        st.stop()
-
     if not gemini_key or not youtube_key:
         st.info("Add your **Gemini API Key** and **YouTube API Key** in the sidebar to enable the Title Generator.")
     else:
@@ -933,9 +929,11 @@ with tab_titles:
             label_visibility="collapsed",
         )
 
-        col_num, col_spacer = st.columns([1, 2])
+        col_num, col_channel, col_spacer = st.columns([1, 1, 1])
         with col_num:
             num_titles = st.slider("Number of titles", min_value=5, max_value=15, value=10)
+        with col_channel:
+            target_channel = st.selectbox("Target Channel", ["Unpopular", "Vee Cams"])
 
         st.markdown("")
 
@@ -949,7 +947,7 @@ with tab_titles:
             st.markdown("---")
             st.markdown("##### Step 1 — Understanding your video")
             with st.spinner("Analyzing video with Gemini AI (transcript + context)..."):
-                video_analysis = analyze_video_with_gemini(video_url.strip(), gemini_key)
+                video_analysis = analyze_video_with_gemini(video_url.strip(), gemini_key, youtube_key)
 
             if video_analysis.get("error"):
                 st.error(f"Video analysis failed: {video_analysis['error']}")
@@ -987,6 +985,7 @@ with tab_titles:
                     similar_titles=similar_videos,
                     anthropic_key=anthropic_key,
                     num_titles=num_titles,
+                    target_channel=target_channel,
                 )
 
             if titles and titles[0].get("title", "").startswith("Error"):
@@ -1010,7 +1009,7 @@ with tab_titles:
                 col_title, col_conf = st.columns([5, 1])
                 with col_title:
                     st.markdown(f"**{i+1}. {t['title']}**")
-                    st.caption(f"Structure: {t.get('structure', '—')} · Hook: {t.get('hook', '—')}")
+                    st.caption(f"Structure: {t.get('structure', '—')} · Hook: {t.get('hook', '—')} · {t.get('reasoning', '')}")
                 with col_conf:
                     st.markdown(f"### {badge} {confidence}/10")
 

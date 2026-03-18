@@ -1,4 +1,4 @@
-"""YouTube Title Generator — bodycam niche specialist using Gemini + Claude."""
+"""YouTube Title Generator — bodycam niche specialist using Gemini + Claude Opus."""
 
 import json
 import re
@@ -6,95 +6,138 @@ import anthropic
 from youtube_transcript_api import YouTubeTranscriptApi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BODYCAM NICHE RESEARCH DATABASE (from 191 videos across 10 top channels)
+# DEEP RESEARCH DATABASE — 1,940 long-form videos across 7 channels
+# Channels: Unpopular (646), Vee Cams (170), BodyCamEdition (177),
+#           MidwestCrime (134), DailyDoseOfCrime (319), BodyCamWatch (219),
+#           CrimeTimeCam (275)
+# All 8+ minutes, zero shorts
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TITLE_PATTERNS = {
+# Channel-specific DNA — what works for OUR channels
+CHANNEL_DNA = {
+    "Unpopular": {
+        "subs": 368000,
+        "total_videos": 646,
+        "winning_formula": "Rescue/save narratives involving kids and toxic/dangerous parents",
+        "best_opener": "Cops (1.84x avg) > Police (0.95x avg)",
+        "top_keywords": {
+            "Rescue": {"count": 64, "avg_ratio": 2.01, "max_ratio": 19.80},
+            "Insane/Insanely": {"count": 5, "avg_ratio": 2.46, "max_ratio": 7.64},
+            "Nightmare": {"count": 7, "avg_ratio": 2.21, "max_ratio": 7.45},
+            "Dangerous": {"count": 18, "avg_ratio": 1.33, "max_ratio": 7.64},
+            "Kids/Children": {"count": 125, "avg_ratio": 1.29, "max_ratio": 9.16},
+            "EXTREMELY": {"count": 46, "avg_ratio": 1.29, "max_ratio": 19.80},
+            "Toxic": {"count": 58, "avg_ratio": 1.03, "max_ratio": 19.80},
+        },
+        "underperforming_keywords": ["Karen (0.39x)", "Drunk (0.34x)", "Man (0.39x)"],
+        "optimal_length": "45-65 characters (0.85x avg vs 0.65x for 65+)",
+        "viral_titles": [
+            {"title": "Police Rescue Family From EXTREMELY Toxic Mother", "ratio": 19.8},
+            {"title": "Police Save Kids From a Teen Who Terrorized the Neighbourhood", "ratio": 9.16},
+            {"title": "Cops RESCUE Kid From a Terrifying House of Horrors", "ratio": 8.74},
+            {"title": "Little Girl's 911 Call Rescues Her From INSANELY Dangerous Mother", "ratio": 7.64},
+            {"title": "Cops RESCUE 5 Kids From a Living Nightmare Inside Their Home", "ratio": 7.45},
+            {"title": "Police Discover Dr*gs in 5-Year-Old's System, Mom Gets in BIG Trouble", "ratio": 6.87},
+            {"title": "20-Year-Old's Shoplifting Spree Ends In Worst Way Possible", "ratio": 6.75},
+            {"title": "Kid Calls Cops After His Mom Passes Out Doing Drugs", "ratio": 5.84},
+            {"title": "Millionaire HOA Boss Fights Neighbor, Then Gets Reality Check", "ratio": 5.54},
+            {"title": "Woman Loses It When Facebook Date Refuses to Let Her Stay the Night", "ratio": 5.28},
+        ],
+    },
+    "Vee Cams": {
+        "subs": 45400,
+        "total_videos": 170,
+        "winning_formula": "Punchy, specific hooks with dramatic reveals — uses censoring asterisks and 'Ends Badly'",
+        "best_opener": "Specific detail openers (Son's, 4-Year-Old's, Karen)",
+        "viral_titles": [
+            {"title": "Police Rescue Kids as TEEN Terrorizes Neighborhood", "ratio": 24.3},
+            {"title": "Cops Find 3 Kids Sleeping in Road While Mom at Nightclub", "ratio": 22.46},
+            {"title": "Terrified Mom Rescues 3 Kids From Granny's Toxic Business", "ratio": 22.32},
+            {"title": "Son's Snapchat Texts Lead Cops to Mom's Hidden Nightmare", "ratio": 12.05},
+            {"title": "Karen Refuses To Leave Walmart& All Hell Breaks Loose", "ratio": 12.03},
+            {"title": "4-Year-Old's 911 Call Exposes Karen's House Of Horror", "ratio": 11.46},
+            {"title": "Airport Karen Loses Control& Attacks Officers Mid-Flight", "ratio": 9.58},
+            {"title": "Neglectful Mom Gets Drunk While Her Child Is Freezing Outside * Ends Badly *", "ratio": 8.7},
+            {"title": "Mom With 11yo Wrecks School Bus& Her World Collapses", "ratio": 7.82},
+            {"title": "Couple Laughs At Cops Until The Safe Pops Open", "ratio": 7.8},
+        ],
+    },
+}
+
+# Top performing competitor titles for reference
+COMPETITOR_TOP_TITLES = [
+    {"title": "The Moment She Realized She Killed 2 People", "views": 20409867, "ratio": 26.54, "channel": "Midwest Crime"},
+    {"title": "Racist Woman Arrested After Attacking Senior Citizen at the Airport", "views": 15140538, "ratio": 24.03, "channel": "Body Cam Edition"},
+    {"title": "Police Give Rebellious Woman a Lesson She Won't Forget", "views": 11535643, "ratio": 18.31, "channel": "Body Cam Edition"},
+    {"title": "How Officers Find Out He's Got a Body in the House", "views": 10234142, "ratio": 10.57, "channel": "Body Cam Watch"},
+    {"title": "Warrant Attempt Turns into Apartment Gunfight", "views": 9490398, "ratio": 12.34, "channel": "Midwest Crime"},
+    {"title": "When a Walmart Shoplifter Thinks She's Entitled to Steal", "views": 9039255, "ratio": 9.34, "channel": "Body Cam Watch"},
+    {"title": "Here's Why You Don't Pull a SAW on the Cops", "views": 8937957, "ratio": 11.62, "channel": "Midwest Crime"},
+    {"title": "19-Year-Old Doesn't Realize He Just Ended Someone's Life", "views": 8116314, "ratio": 12.88, "channel": "Body Cam Edition"},
+    {"title": "The Fake UPS Delivery That Turned Deadly", "views": 8075762, "ratio": 10.5, "channel": "Midwest Crime"},
+    {"title": "Entitled 18-Year-Old Causes Complete Chaos During Arrest", "views": 7610300, "ratio": 12.08, "channel": "Body Cam Edition"},
+    {"title": "Wandering Toddler Leads Police to His Irresponsible Mom", "views": 6133902, "ratio": 7.69, "channel": "Daily Dose Of Crime"},
+    {"title": "Abusive Woman Punches Publix Employee In Front Of Police", "views": 4776021, "ratio": 19.34, "channel": "Crime Time Cam"},
+    {"title": "World's Most Disrespectful Teen Learns a Lesson in Authority", "views": 4615287, "ratio": 18.69, "channel": "Crime Time Cam"},
+    {"title": "Cops Rescue 7 Children After Disturbing Traffic Stop", "views": 4796185, "ratio": 6.01, "channel": "Daily Dose Of Crime"},
+    {"title": "12-Year-Old Secretly Calls Police on Abusive Father, Doesn't End Well", "views": 4080990, "ratio": 17.82, "channel": "Police Release"},
+]
+
+# Niche-wide proven patterns
+PROVEN_PATTERNS = {
     "structures": {
+        "Cops/Police [Action] [Person] From [Situation]": {
+            "avg_ratio": 2.01, "best_for": "Unpopular",
+            "examples": [
+                "Police Rescue Family From EXTREMELY Toxic Mother",
+                "Cops RESCUE Kid From a Terrifying House of Horrors",
+                "Cops RESCUE 5 Kids From a Living Nightmare Inside Their Home",
+            ],
+        },
+        "[Specific Detail] Leads/Exposes [Dramatic Reveal]": {
+            "avg_ratio": 1.8, "best_for": "Vee Cams",
+            "examples": [
+                "Son's Snapchat Texts Lead Cops to Mom's Hidden Nightmare",
+                "4-Year-Old's 911 Call Exposes Karen's House Of Horror",
+                "Little Girl's 911 Call Rescues Her From INSANELY Dangerous Mother",
+            ],
+        },
         "How X Turns into Y": {
-            "frequency": "30% of top 50",
+            "avg_ratio": 1.2, "best_for": "Body Cam Watch",
             "examples": [
                 "How Officers Find Out He's Got a Body in the House",
                 "How a Driveway Confrontation Turns a Citation into an Arrest",
-                "How a Restaurant Complaint Becomes an Arrestable Offense",
-                "How Demanding a Store Discount Turns into an Arrest",
-                "How a 21-Year-Old Turns a Misdemeanor into a Felony",
-                "How Some Flashing Blue Lights Turns into a Police Impersonation Charge",
-                "How to Immediately Get Pulled Over by the Police",
             ],
         },
-        "The Moment X": {
-            "frequency": "8% of top 50",
+        "The Moment [Person] Realized [Consequence]": {
+            "avg_ratio": 1.5, "best_for": "Midwest Crime",
             "examples": [
                 "The Moment She Realized She Killed 2 People",
-                "The Moment He Realized He Killed Someone",
-                "The Moment She Discovered Her Husband's Horrifying Secret",
-                "The Fake UPS Delivery That Turned Deadly",
-                "The Case of the Minnesota Assassin",
+                "19-Year-Old Doesn't Realize He Just Ended Someone's Life",
             ],
         },
-        "When X": {
-            "frequency": "12% of top 50",
+        "[Person] [Action] & [Dramatic Consequence]": {
+            "avg_ratio": 1.6, "best_for": "Vee Cams",
             "examples": [
-                "When a Walmart Shoplifter Thinks She's Entitled to Steal",
-                "When the Suspects Try to Take Over the Investigation",
-            ],
-        },
-        "[Adjective] [Person] [Action]": {
-            "frequency": "25% of top 50",
-            "examples": [
-                "Racist Woman Arrested After Attacking Senior Citizen at the Airport",
-                "Entitled 18-Year-Old Causes Complete Chaos During Arrest",
-                "Disturbed Woman Kicked Off Airplane for Outrageous Behavior",
-                "Teenage Illegal Immigrant Caught Trafficking $700,000 Worth Of Illegal Substance",
-                "High School Student Arrested After Flashing Handgun At Students In Class Room",
-                "Abusive Woman Punches Publix Employee In Front Of Police",
+                "Karen Refuses To Leave Walmart& All Hell Breaks Loose",
+                "Mom With 11yo Wrecks School Bus& Her World Collapses",
+                "Couple Laughs At Cops Until The Safe Pops Open",
             ],
         },
     },
-    "power_phrases": [
-        "The Moment", "Realized", "Turns into", "Won't Forget",
-        "Doesn't End Well", "Caught", "Lesson", "Entitled",
-        "Complete Chaos", "Goes Off", "Thinks She's/He's",
-        "Here's Why You Don't", "Led Police to", "Real-Life",
+    "high_performing_keywords": [
+        "RESCUE (2.01x)", "Nightmare (2.21x)", "Insane/Insanely (2.46x)",
+        "EXTREMELY (1.29x)", "Toxic (1.03x)", "Kids/Children (1.29x)",
+        "Ends Badly", "House of Horrors", "Living Nightmare",
+        "Gets in BIG Trouble", "All Hell Breaks Loose", "Worst Way Possible",
     ],
-    "character_archetypes": [
-        "Woman", "Man", "Teen", "[Age]-Year-Old", "Mom/Mother",
-        "Officer/Cop", "Student", "Employee", "Suspect", "Father/Dad",
+    "low_performing_avoid": [
+        "Karen (0.39x on Unpopular)", "Drunk (0.34x)", "Man (0.39x on Unpopular)",
+        "When (0.51x opener)", "Woman's (0.38x opener)",
     ],
-    "emotional_triggers": [
-        "Arrest", "Kill/Dead/Death", "Realize/Realized",
-        "Turns into", "Chaos", "Lesson", "Gun/Gunfight",
-        "Caught", "Steal/Stole/Stolen", "Rescue", "Entitled",
-        "Confrontation", "Deadly", "Secret", "Discover",
-    ],
-    "avg_title_length": 56,
-    "optimal_range": (35, 75),
+    "optimal_length": {"min": 45, "max": 65, "avg": 56},
+    "censoring_trick": "Use asterisks (Dr*gs, K*ll, Vi*lent) — creates curiosity + safe for algorithm",
 }
-
-# Long-form only (8+ min) — 417 videos researched across 10 channels, zero shorts
-TOP_PERFORMING_TITLES = [
-    {"title": "The Moment She Realized She Killed 2 People", "views": 20409844, "ratio": 26.54},
-    {"title": "Racist Woman Arrested After Attacking Senior Citizen at the Airport", "views": 15140481, "ratio": 24.03},
-    {"title": "Police Give Rebellious Woman a Lesson She Won't Forget", "views": 11535273, "ratio": 18.31},
-    {"title": "How Officers Find Out He's Got a Body in the House", "views": 10234029, "ratio": 10.57},
-    {"title": "Warrant Attempt Turns into Apartment Gunfight", "views": 9490007, "ratio": 12.34},
-    {"title": "When a Walmart Shoplifter Thinks She's Entitled to Steal", "views": 9039104, "ratio": 9.34},
-    {"title": "Here's Why You Don't Pull a SAW on the Cops", "views": 8937796, "ratio": 11.62},
-    {"title": "Teenage Illegal Immigrant Caught Trafficking $700,000 Worth Of Illegal Substance", "views": 8596369, "ratio": 19.99},
-    {"title": "Duluth Bodycam is a Real-Life 'Fargo' Movie", "views": 8287808, "ratio": 10.78},
-    {"title": "19-Year-Old Doesn't Realize He Just Ended Someone's Life", "views": 8116273, "ratio": 12.88},
-    {"title": "The Fake UPS Delivery That Turned Deadly", "views": 8075701, "ratio": 10.5},
-    {"title": "Entitled 18-Year-Old Causes Complete Chaos During Arrest", "views": 7610107, "ratio": 12.08},
-    {"title": "Police Rescue Family From EXTREMELY Toxic Mother", "views": 7285917, "ratio": 19.8},
-    {"title": "How a Restaurant Complaint Becomes an Arrestable Offense", "views": 7135616, "ratio": 7.37},
-    {"title": "Employee Arrested for Stealing $25,000 to Purchase a Gucci Purse And New Car", "views": 6669548, "ratio": 15.51},
-    {"title": "Disturbed Woman Kicked Off Airplane for Outrageous Behavior", "views": 6663588, "ratio": 10.58},
-    {"title": "12-Year-Old Secretly Calls Police on Abusive Father, Doesn't End Well", "views": 4080990, "ratio": 17.82},
-    {"title": "World's Most Disrespectful Teen Learns a Lesson in Authority", "views": 4615143, "ratio": 18.68},
-    {"title": "Abusive Woman Punches Publix Employee In Front Of Police", "views": 4776021, "ratio": 19.34},
-    {"title": "Man Makes His Day 10 Times Worse After Getting Fired from BMW", "views": 3750047, "ratio": 16.38},
-]
 
 
 def _parse_duration(duration_str: str) -> int:
@@ -115,9 +158,7 @@ def get_youtube_transcript(video_id: str) -> str:
     try:
         api = YouTubeTranscriptApi()
         transcript = api.fetch(video_id)
-        # Combine all text entries
         full_text = " ".join(entry.text for entry in transcript)
-        # Truncate if too long
         if len(full_text) > 15000:
             full_text = full_text[:15000]
         return full_text
@@ -125,111 +166,81 @@ def get_youtube_transcript(video_id: str) -> str:
         return f"[Transcript unavailable: {e}]"
 
 
-def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
-    """Download video with yt-dlp, upload to Gemini, get full visual + audio analysis."""
+def _get_video_metadata(video_id: str, youtube_key: str) -> dict:
+    """Get video title, description, and tags from YouTube API."""
+    try:
+        from googleapiclient.discovery import build
+        youtube = build("youtube", "v3", developerKey=youtube_key)
+        resp = youtube.videos().list(part="snippet", id=video_id).execute()
+        if resp.get("items"):
+            snippet = resp["items"][0]["snippet"]
+            return {
+                "title": snippet.get("title", ""),
+                "description": snippet.get("description", "")[:2000],
+                "tags": snippet.get("tags", []),
+                "channel": snippet.get("channelTitle", ""),
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str = None) -> dict:
+    """Analyze video using transcript + metadata with strict accuracy prompting."""
     from google import genai
-    import subprocess
-    import tempfile
-    import os
-    import time
 
     video_id = extract_video_id(video_url)
     if not video_id:
         return {"error": "Invalid YouTube URL"}
 
+    transcript = get_youtube_transcript(video_id)
+    if transcript.startswith("[Transcript unavailable"):
+        return {"error": f"Cannot analyze video — {transcript}"}
+
+    metadata = _get_video_metadata(video_id, youtube_key) if youtube_key else {}
+
     client = genai.Client(api_key=gemini_key)
 
-    # Step 1: Download video with yt-dlp (lowest quality MP4)
-    tmp_dir = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, "video.mp4")
+    prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation.
 
-    try:
-        result = subprocess.run(
-            ['yt-dlp', '-f', 'worst[ext=mp4]', '-o', tmp_path,
-             f'https://www.youtube.com/watch?v={video_id}'],
-            capture_output=True, text=True, timeout=300
-        )
-        if not os.path.exists(tmp_path):
-            # Fallback: any mp4
-            subprocess.run(
-                ['yt-dlp', '-S', '+size', '--recode-video', 'mp4', '-o', tmp_path,
-                 f'https://www.youtube.com/watch?v={video_id}'],
-                capture_output=True, text=True, timeout=300
-            )
-    except FileNotFoundError:
-        return {"error": "yt-dlp is not installed. Title Generator requires local setup — run the app on localhost, not Streamlit Cloud."}
-    except subprocess.TimeoutExpired:
-        return {"error": "Video download timed out (5 min limit)"}
+CRITICAL: You can ONLY read the transcript below. You CANNOT see the video.
+- ONLY describe what is explicitly stated in dialogue/narration
+- Do NOT imagine or hallucinate ANY visual details
+- Use EXACT quotes and names from the transcript
+- If something is unclear, say so — do NOT guess
 
-    if not os.path.exists(tmp_path):
-        return {"error": f"Failed to download video. Make sure yt-dlp is installed: pip install yt-dlp"}
+VIDEO METADATA:
+- Original title: {metadata.get('title', 'Unknown')}
+- Channel: {metadata.get('channel', 'Unknown')}
+- Description: {metadata.get('description', 'N/A')[:500]}
 
-    file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+FULL TRANSCRIPT:
+{transcript}
 
-    # Step 2: Upload to Gemini Files API
-    try:
-        uploaded = client.files.upload(file=tmp_path)
+Based STRICTLY on the transcript, provide:
 
-        wait_start = time.time()
-        while uploaded.state.name == 'PROCESSING':
-            if time.time() - wait_start > 300:
-                return {"error": "Gemini video processing timed out"}
-            time.sleep(3)
-            uploaded = client.files.get(name=uploaded.name)
+1. **WHAT HAPPENED** — Full incident description using ONLY transcript information. Names, charges, what police did, how it ended.
 
-        if uploaded.state.name != 'ACTIVE':
-            return {"error": f"Gemini file processing failed: {uploaded.state.name}"}
+2. **KEY DRAMATIC MOMENTS** — Most shocking/tense dialogue moments. Quote exact words.
 
-    except Exception as e:
-        return {"error": f"Gemini upload failed: {e}"}
-    finally:
-        # Clean up
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        try:
-            os.rmdir(tmp_dir)
-        except OSError:
-            pass
+3. **PEOPLE INVOLVED** — Each person: role, name if stated, gender, age if mentioned, behavior/attitude from their dialogue.
 
-    # Step 3: Gemini watches the actual video
-    prompt = """You are analyzing a bodycam/crime YouTube video for title generation. Watch the ENTIRE video carefully.
+4. **SEVERITY** — 1-10 based on what's described.
 
-BE EXTREMELY ACCURATE. Only describe what you actually see and hear. Do NOT make anything up.
+5. **CLICKBAIT ANGLES** — What aspects drive the most curiosity?
 
-Provide a detailed breakdown:
+6. **SIMILAR TO** — What type of viral bodycam content is this?
 
-1. **WHAT HAPPENED** — Describe the full incident in detail. Who was involved (use real names if mentioned)? What was the crime? What did police do? How did it escalate? How did it end?
-
-2. **KEY DRAMATIC MOMENTS** — What are the most shocking, tense, or emotionally charged moments? Include timestamps if possible.
-
-3. **PEOPLE INVOLVED** — Describe each person: their role (suspect, officer, victim, bystander), name if mentioned, approximate age, gender, behavior, attitude.
-
-4. **SEVERITY LEVEL** — On a scale of 1-10, how shocking/intense is this incident? Why?
-
-5. **CLICKBAIT ANGLES** — What aspects of this story would generate the most curiosity and clicks?
-   - What's the most intriguing single detail?
-   - What's the "twist" or unexpected element?
-   - What emotional reaction will viewers have?
-
-6. **SIMILAR TO** — What type of viral bodycam content does this remind you of?
-
-Return your analysis as JSON:
-{"what_happened": "...", "key_moments": ["...", "..."], "people": [{"role": "...", "description": "..."}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}
+Return ONLY valid JSON:
+{{"what_happened": "...", "key_moments": ["...", "..."], "people": [{{"role": "...", "description": "..."}}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}}
 """
 
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=[uploaded, prompt]
+            contents=prompt
         )
         raw = response.text.strip()
-
-        # Clean up uploaded file from Gemini
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
-
         json_match = re.search(r'\{[\s\S]*\}', raw)
         if json_match:
             return json.loads(json_match.group())
@@ -244,7 +255,6 @@ def search_similar_videos(video_analysis: dict, youtube_key: str, max_results: i
 
     youtube = build("youtube", "v3", developerKey=youtube_key)
 
-    # Build search queries based on the video analysis
     summary = video_analysis.get("one_line_summary", "")
     similar_to = video_analysis.get("similar_to", "")
     clickbait_angles = video_analysis.get("clickbait_angles", [])
@@ -262,19 +272,13 @@ def search_similar_videos(video_analysis: dict, youtube_key: str, max_results: i
     for query in queries[:3]:
         try:
             search_resp = youtube.search().list(
-                part="snippet",
-                q=query,
-                type="video",
-                order="viewCount",
-                maxResults=min(max_results, 25),
+                part="snippet", q=query, type="video",
+                order="viewCount", maxResults=min(max_results, 25),
             ).execute()
 
-            video_ids = []
-            for item in search_resp.get("items", []):
-                vid = item["id"]["videoId"]
-                if vid not in seen_ids:
-                    seen_ids.add(vid)
-                    video_ids.append(vid)
+            video_ids = [item["id"]["videoId"] for item in search_resp.get("items", [])
+                         if item["id"]["videoId"] not in seen_ids]
+            seen_ids.update(video_ids)
 
             if video_ids:
                 stats_resp = youtube.videos().list(
@@ -283,9 +287,8 @@ def search_similar_videos(video_analysis: dict, youtube_key: str, max_results: i
                 ).execute()
 
                 for item in stats_resp.get("items", []):
-                    # Filter out Shorts and videos under 8 minutes
                     duration = _parse_duration(item.get("contentDetails", {}).get("duration", ""))
-                    if duration < 480:  # 8 minutes = 480 seconds
+                    if duration < 480:
                         continue
                     views = int(item["statistics"].get("viewCount", 0))
                     all_videos.append({
@@ -297,7 +300,6 @@ def search_similar_videos(video_analysis: dict, youtube_key: str, max_results: i
         except Exception:
             continue
 
-    # Sort by views, return top performers
     all_videos.sort(key=lambda v: v["views"], reverse=True)
     return all_videos[:max_results]
 
@@ -307,105 +309,125 @@ def generate_titles(
     similar_titles: list[dict],
     anthropic_key: str,
     num_titles: int = 10,
+    target_channel: str = "Unpopular",
 ) -> list[dict]:
-    """Use Claude to generate optimized titles based on video analysis and research."""
+    """Use Claude Opus to generate optimized titles based on deep channel research."""
 
-    # Build the similar titles reference
+    # Get channel-specific DNA
+    channel_dna = CHANNEL_DNA.get(target_channel, CHANNEL_DNA["Unpopular"])
+
+    # Build channel-specific viral titles reference
+    channel_viral = "\n".join(
+        f"  - \"{t['title']}\" ({t['ratio']}x sub ratio)"
+        for t in channel_dna["viral_titles"]
+    )
+
+    # Build competitor reference
+    competitor_ref = "\n".join(
+        f"  - \"{t['title']}\" ({t['views']:,} views, {t['ratio']}x ratio) [{t['channel']}]"
+        for t in COMPETITOR_TOP_TITLES[:10]
+    )
+
+    # Build similar titles reference
     similar_ref = "\n".join(
         f"  - \"{t['title']}\" ({t['views']:,} views)"
-        for t in similar_titles[:15]
+        for t in similar_titles[:10]
     )
 
-    # Build the top-performing reference
-    top_ref = "\n".join(
-        f"  - \"{t['title']}\" ({t['views']:,} views, {t['ratio']}x sub ratio)"
-        for t in TOP_PERFORMING_TITLES[:15]
-    )
+    # Build patterns reference
+    patterns_ref = ""
+    for name, data in PROVEN_PATTERNS["structures"].items():
+        examples = "\n".join(f"      \"{e}\"" for e in data["examples"])
+        patterns_ref += f"\n  {name} (avg {data['avg_ratio']}x, best for {data['best_for']}):\n{examples}\n"
 
-    # Build pattern reference
-    patterns_ref = json.dumps(TITLE_PATTERNS["structures"], indent=2)
-
-    prompt = f"""You are the world's #1 YouTube title specialist for the BODYCAM / CRIME niche. Your titles consistently generate millions of views. You understand exactly what makes people click.
+    prompt = f"""You are the title strategist for "{target_channel}", a bodycam/crime YouTube channel. You have deep knowledge of what works on this specific channel based on data from {channel_dna['total_videos']} videos.
 
 ═══════════════════════════════════════
-VIDEO ANALYSIS
+CHANNEL INTELLIGENCE: {target_channel}
+═══════════════════════════════════════
+Subscribers: {channel_dna['subs']:,}
+Winning formula: {channel_dna['winning_formula']}
+Best opener: {channel_dna['best_opener']}
+{f"Top keywords: " + ", ".join(f"{k} ({v['avg_ratio']}x)" for k, v in channel_dna.get('top_keywords', {}).items())}
+{f"AVOID these (underperform): " + ", ".join(channel_dna.get('underperforming_keywords', [])) if channel_dna.get('underperforming_keywords') else ""}
+
+{target_channel}'s PROVEN VIRAL TITLES:
+{channel_viral}
+
+═══════════════════════════════════════
+VIDEO TO TITLE
 ═══════════════════════════════════════
 {json.dumps(video_analysis, indent=2)}
 
 ═══════════════════════════════════════
-SIMILAR VIDEOS ON YOUTUBE (top performers for this topic)
+SIMILAR VIRAL VIDEOS ON THIS TOPIC
 ═══════════════════════════════════════
 {similar_ref}
 
 ═══════════════════════════════════════
-ALL-TIME TOP PERFORMING BODYCAM TITLES (proven winners)
+COMPETITOR MEGA-HITS (what goes viral across the niche)
 ═══════════════════════════════════════
-{top_ref}
+{competitor_ref}
 
 ═══════════════════════════════════════
-PROVEN TITLE STRUCTURES (from research across 10 top bodycam channels)
+PROVEN TITLE STRUCTURES (ranked by performance)
 ═══════════════════════════════════════
 {patterns_ref}
 
-POWER PHRASES that drive clicks: {', '.join(TITLE_PATTERNS['power_phrases'])}
-CHARACTER ARCHETYPES that work: {', '.join(TITLE_PATTERNS['character_archetypes'])}
-EMOTIONAL TRIGGERS: {', '.join(TITLE_PATTERNS['emotional_triggers'])}
-
-Optimal title length: {TITLE_PATTERNS['avg_title_length']} characters (range: {TITLE_PATTERNS['optimal_range'][0]}-{TITLE_PATTERNS['optimal_range'][1]})
+HIGH-PERFORMING KEYWORDS: {", ".join(PROVEN_PATTERNS["high_performing_keywords"])}
+AVOID (underperform): {", ".join(PROVEN_PATTERNS["low_performing_avoid"])}
+Optimal length: {PROVEN_PATTERNS["optimal_length"]["min"]}-{PROVEN_PATTERNS["optimal_length"]["max"]} chars
+Censoring trick: {PROVEN_PATTERNS["censoring_trick"]}
 
 ═══════════════════════════════════════
 YOUR TASK
 ═══════════════════════════════════════
 
-Generate exactly {num_titles} title options for this video. Each title must:
+Generate exactly {num_titles} titles for this video that would perform on {target_channel}.
 
-1. Use one of the PROVEN STRUCTURES above (How X, The Moment X, When X, or [Adjective] [Person] [Action])
-2. Include at least one POWER PHRASE or EMOTIONAL TRIGGER
-3. Create a "curiosity gap" — make the viewer NEED to know what happens
-4. Be specific enough to be intriguing but vague enough to require watching
-5. Stay within 35-75 characters
-6. NEVER reveal the full outcome — tease it
-7. Use the most clickable/shocking angle from the video analysis
-8. Sound like it belongs on a top bodycam channel
+RULES:
+1. Study {target_channel}'s viral titles above — your titles MUST feel like they belong on this channel
+2. Use the channel's winning formula and best-performing keywords
+3. Avoid the channel's underperforming keywords
+4. Stay within 45-65 characters (the sweet spot)
+5. Create a curiosity gap — make the viewer NEED to watch
+6. Be specific (ages, numbers, details) but don't reveal the outcome
+7. NEVER use "BODYCAM:" prefix
+8. Use ALL CAPS sparingly — max ONE word (RESCUE, EXTREMELY, INSANELY)
+9. Consider using asterisks for sensitive words (Dr*gs, K*ll) — it works on Vee Cams
+10. The title must accurately represent the video content
 
-For each title, also provide:
+For each title provide:
+- "title": the title
 - "structure": which proven structure it uses
-- "hook": what curiosity gap or emotional trigger it exploits
-- "confidence": 1-10 how likely this is to perform well based on the research data
-
-IMPORTANT RULES:
-- Do NOT use "BODYCAM:" or "Body Cam:" as a prefix — the niche audience already knows
-- Do NOT use all caps unless it's a single word for emphasis
-- Do NOT use clickbait that doesn't match the content — it must be accurate
-- DO front-load the most intriguing element
-- DO use specific details (ages, dollar amounts, locations) when they add shock value
+- "hook": the curiosity gap / emotional trigger
+- "confidence": 1-10 predicted performance based on channel data
+- "reasoning": one sentence on why this would work for {target_channel}
 
 Return ONLY valid JSON array:
-[{{"title": "...", "structure": "...", "hook": "...", "confidence": 8}}, ...]
+[{{"title": "...", "structure": "...", "hook": "...", "confidence": 8, "reasoning": "..."}}]
 """
 
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            temperature=0.8,  # Higher temp for creative variety
+            model="claude-opus-4-6",
+            max_tokens=3000,
+            temperature=0.8,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
 
-        # Parse JSON array
         json_match = re.search(r'\[[\s\S]*\]', raw)
         if json_match:
             titles = json.loads(json_match.group())
-            # Sort by confidence
             titles.sort(key=lambda t: t.get("confidence", 0), reverse=True)
             return titles
-        return [{"title": "Error: Could not parse titles", "structure": "", "hook": "", "confidence": 0}]
+        return [{"title": "Error: Could not parse titles", "structure": "", "hook": "", "confidence": 0, "reasoning": ""}]
 
     except Exception as e:
-        return [{"title": f"Error: {e}", "structure": "", "hook": "", "confidence": 0}]
+        return [{"title": f"Error: {e}", "structure": "", "hook": "", "confidence": 0, "reasoning": ""}]
 
 
 def extract_video_id(url: str) -> str | None:
