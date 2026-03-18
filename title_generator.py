@@ -315,7 +315,7 @@ Return ONLY valid JSON array:
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6-20250627",
+            model="claude-sonnet-4-20250514",
             max_tokens=2048,
             temperature=0.8,  # Higher temp for creative variety
             messages=[{"role": "user", "content": prompt}],
