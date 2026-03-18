@@ -72,28 +72,42 @@ TITLE_PATTERNS = {
     "optimal_range": (35, 75),
 }
 
+# Long-form only (8+ min) — 417 videos researched across 10 channels, zero shorts
 TOP_PERFORMING_TITLES = [
     {"title": "The Moment She Realized She Killed 2 People", "views": 20409844, "ratio": 26.54},
     {"title": "Racist Woman Arrested After Attacking Senior Citizen at the Airport", "views": 15140481, "ratio": 24.03},
     {"title": "Police Give Rebellious Woman a Lesson She Won't Forget", "views": 11535273, "ratio": 18.31},
-    {"title": "How Officers Find Out He's Got a Body in the House", "views": 10234018, "ratio": 10.57},
-    {"title": "Warrant Attempt Turns into Apartment Gunfight", "views": 9490003, "ratio": 12.34},
+    {"title": "How Officers Find Out He's Got a Body in the House", "views": 10234029, "ratio": 10.57},
+    {"title": "Warrant Attempt Turns into Apartment Gunfight", "views": 9490007, "ratio": 12.34},
     {"title": "When a Walmart Shoplifter Thinks She's Entitled to Steal", "views": 9039104, "ratio": 9.34},
     {"title": "Here's Why You Don't Pull a SAW on the Cops", "views": 8937796, "ratio": 11.62},
-    {"title": "Teenage Illegal Immigrant Caught Trafficking $700,000 Worth Of Illegal Substance", "views": 8596342, "ratio": 19.99},
+    {"title": "Teenage Illegal Immigrant Caught Trafficking $700,000 Worth Of Illegal Substance", "views": 8596369, "ratio": 19.99},
     {"title": "Duluth Bodycam is a Real-Life 'Fargo' Movie", "views": 8287808, "ratio": 10.78},
     {"title": "19-Year-Old Doesn't Realize He Just Ended Someone's Life", "views": 8116273, "ratio": 12.88},
-    {"title": "The Fake UPS Delivery That Turned Deadly", "views": 8075684, "ratio": 10.5},
+    {"title": "The Fake UPS Delivery That Turned Deadly", "views": 8075701, "ratio": 10.5},
     {"title": "Entitled 18-Year-Old Causes Complete Chaos During Arrest", "views": 7610107, "ratio": 12.08},
     {"title": "Police Rescue Family From EXTREMELY Toxic Mother", "views": 7285917, "ratio": 19.8},
-    {"title": "How a Restaurant Complaint Becomes an Arrestable Offense", "views": 7135618, "ratio": 7.37},
+    {"title": "How a Restaurant Complaint Becomes an Arrestable Offense", "views": 7135616, "ratio": 7.37},
     {"title": "Employee Arrested for Stealing $25,000 to Purchase a Gucci Purse And New Car", "views": 6669548, "ratio": 15.51},
-    {"title": "Disturbed Woman Kicked Off Airplane for Outrageous Behavior", "views": 6663578, "ratio": 10.58},
-    {"title": "12-Year-Old Secretly Calls Police on Abusive Father, Doesn't End Well", "views": 4080983, "ratio": 17.82},
+    {"title": "Disturbed Woman Kicked Off Airplane for Outrageous Behavior", "views": 6663588, "ratio": 10.58},
+    {"title": "12-Year-Old Secretly Calls Police on Abusive Father, Doesn't End Well", "views": 4080990, "ratio": 17.82},
     {"title": "World's Most Disrespectful Teen Learns a Lesson in Authority", "views": 4615143, "ratio": 18.68},
     {"title": "Abusive Woman Punches Publix Employee In Front Of Police", "views": 4776021, "ratio": 19.34},
-    {"title": "Man Makes His Day 10 Times Worse After Getting Fired from BMW", "views": 3750050, "ratio": 16.38},
+    {"title": "Man Makes His Day 10 Times Worse After Getting Fired from BMW", "views": 3750047, "ratio": 16.38},
 ]
+
+
+def _parse_duration(duration_str: str) -> int:
+    """Parse ISO 8601 duration (PT1H2M3S) to seconds."""
+    if not duration_str:
+        return 0
+    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration_str)
+    if not match:
+        return 0
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def get_youtube_transcript(video_id: str) -> str:
@@ -209,11 +223,15 @@ def search_similar_videos(video_analysis: dict, youtube_key: str, max_results: i
 
             if video_ids:
                 stats_resp = youtube.videos().list(
-                    part="statistics,snippet",
+                    part="statistics,snippet,contentDetails",
                     id=",".join(video_ids[:25]),
                 ).execute()
 
                 for item in stats_resp.get("items", []):
+                    # Filter out Shorts and videos under 8 minutes
+                    duration = _parse_duration(item.get("contentDetails", {}).get("duration", ""))
+                    if duration < 480:  # 8 minutes = 480 seconds
+                        continue
                     views = int(item["statistics"].get("viewCount", 0))
                     all_videos.append({
                         "title": item["snippet"]["title"],
