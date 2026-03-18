@@ -125,112 +125,90 @@ def get_youtube_transcript(video_id: str) -> str:
         return f"[Transcript unavailable: {e}]"
 
 
-def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
-    """Use Gemini to analyze the actual video file — downloads, uploads to Gemini, gets real analysis."""
-    from google import genai
-    from pytubefix import YouTube
-    import tempfile
-    import os
-    import time
+def _get_video_metadata(video_id: str, youtube_key: str = None) -> dict:
+    """Get video title, description, and tags from YouTube API."""
+    if not youtube_key:
+        return {}
+    try:
+        from googleapiclient.discovery import build
+        youtube = build("youtube", "v3", developerKey=youtube_key)
+        resp = youtube.videos().list(part="snippet", id=video_id).execute()
+        if resp.get("items"):
+            snippet = resp["items"][0]["snippet"]
+            return {
+                "title": snippet.get("title", ""),
+                "description": snippet.get("description", "")[:2000],
+                "tags": snippet.get("tags", []),
+                "channel": snippet.get("channelTitle", ""),
+            }
+    except Exception:
+        pass
+    return {}
 
-    # Extract video ID
+
+def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str = None) -> dict:
+    """Analyze video using transcript + metadata. Gemini analyzes ONLY what's in the transcript."""
+    from google import genai
+
     video_id = extract_video_id(video_url)
     if not video_id:
         return {"error": "Invalid YouTube URL"}
 
+    # Get transcript (the actual dialogue/narration)
+    transcript = get_youtube_transcript(video_id)
+    if transcript.startswith("[Transcript unavailable"):
+        return {"error": f"Cannot analyze video — {transcript}"}
+
+    # Get video metadata from YouTube API
+    metadata = _get_video_metadata(video_id, youtube_key)
+
     client = genai.Client(api_key=gemini_key)
 
-    # Step 1: Download video with pytubefix (lowest quality to save bandwidth)
-    tmp_dir = tempfile.mkdtemp()
-    tmp_path = None
-    try:
-        yt = YouTube(f'https://www.youtube.com/watch?v={video_id}')
-        stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').first()
-        if not stream:
-            stream = yt.streams.filter(file_extension='mp4').order_by('resolution').first()
-        if not stream:
-            return {"error": "No downloadable MP4 stream found for this video"}
-        tmp_path = stream.download(output_path=tmp_dir, filename='video.mp4')
-    except Exception as e:
-        return {"error": f"Failed to download video: {e}"}
+    prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation purposes.
 
-    if not tmp_path or not os.path.exists(tmp_path):
-        return {"error": "Video download failed — file not created"}
+CRITICAL RULES:
+- You can ONLY see the transcript below. You CANNOT see the video.
+- ONLY describe what is explicitly stated in the transcript. Do NOT imagine or hallucinate any visual details.
+- If someone says "she stabbed me", report that. Do NOT invent details about weapons, injuries, or scenes that aren't mentioned.
+- Use EXACT quotes and names from the transcript when possible.
 
-    file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+VIDEO METADATA:
+- Original title: {metadata.get('title', 'Unknown')}
+- Channel: {metadata.get('channel', 'Unknown')}
+- Description: {metadata.get('description', 'N/A')[:500]}
 
-    # Step 2: Upload to Gemini Files API
-    try:
-        uploaded = client.files.upload(file=tmp_path)
+FULL TRANSCRIPT:
+{transcript}
 
-        # Wait for processing (Gemini needs to process the video)
-        wait_start = time.time()
-        while uploaded.state.name == 'PROCESSING':
-            if time.time() - wait_start > 300:  # 5 min timeout
-                return {"error": "Gemini video processing timed out"}
-            time.sleep(3)
-            uploaded = client.files.get(name=uploaded.name)
+Based STRICTLY on the transcript above, provide:
 
-        if uploaded.state.name != 'ACTIVE':
-            return {"error": f"Gemini file state: {uploaded.state.name}"}
+1. **WHAT HAPPENED** — Describe the full incident using ONLY information from the transcript. Use real names if mentioned. What was the crime? What did police do? How did it end?
 
-    except Exception as e:
-        return {"error": f"Gemini upload failed: {e}"}
-    finally:
-        # Clean up downloaded file and temp dir
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        if os.path.exists(tmp_dir):
-            try:
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
+2. **KEY DRAMATIC MOMENTS** — What are the most shocking or tense moments from the DIALOGUE? Quote exact words when possible.
 
-    # Step 3: Analyze the actual video with Gemini
-    prompt = """You are analyzing a bodycam/crime YouTube video for title generation. Watch the ENTIRE video carefully.
+3. **PEOPLE INVOLVED** — List each person mentioned: their role, name if stated, gender, behavior/attitude based on their dialogue.
 
-BE EXTREMELY ACCURATE. Only describe what you actually see and hear. Do NOT make anything up.
+4. **SEVERITY LEVEL** — 1-10, based on the charges/incident described in the transcript.
 
-Provide a detailed breakdown:
-
-1. **WHAT HAPPENED** — Describe the full incident in detail. Who was involved (use real names if mentioned)? What was the crime? What did police do? How did it escalate? How did it end?
-
-2. **KEY DRAMATIC MOMENTS** — What are the most shocking, tense, or emotionally charged moments? Include timestamps if possible.
-
-3. **PEOPLE INVOLVED** — Describe each person: their role (suspect, officer, victim, bystander), name if mentioned, approximate age, gender, behavior, attitude (entitled, aggressive, calm, panicking, etc.)
-
-4. **SEVERITY LEVEL** — On a scale of 1-10, how shocking/intense is this incident? Why?
-
-5. **CLICKBAIT ANGLES** — What aspects of this story would generate the most curiosity and clicks? Think about:
-   - What's the most intriguing single detail?
-   - What's the "twist" or unexpected element?
-   - What makes this different from typical bodycam videos?
-   - What emotional reaction will viewers have?
+5. **CLICKBAIT ANGLES** — What aspects would generate the most curiosity and clicks?
 
 6. **SIMILAR TO** — What type of viral bodycam content does this remind you of?
 
-Return your analysis as JSON:
-{"what_happened": "...", "key_moments": ["...", "..."], "people": [{"role": "...", "description": "..."}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}
+Return ONLY valid JSON:
+{{"what_happened": "...", "key_moments": ["...", "..."], "people": [{{"role": "...", "description": "..."}}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}}
 """
 
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=[uploaded, prompt]
+            contents=prompt
         )
         raw = response.text.strip()
 
-        # Clean up the uploaded file from Gemini
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
-
-        # Parse JSON
         json_match = re.search(r'\{[\s\S]*\}', raw)
         if json_match:
             return json.loads(json_match.group())
-        return {"error": f"No JSON in Gemini response", "raw": raw[:500]}
+        return {"error": "No JSON in Gemini response", "raw": raw[:500]}
     except Exception as e:
         return {"error": str(e)}
 

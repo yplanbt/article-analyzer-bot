@@ -945,7 +945,7 @@ with tab_titles:
             st.markdown("---")
             st.markdown("##### Step 1 — Understanding your video")
             with st.spinner("Analyzing video with Gemini AI (transcript + context)..."):
-                video_analysis = analyze_video_with_gemini(video_url.strip(), gemini_key)
+                video_analysis = analyze_video_with_gemini(video_url.strip(), gemini_key, youtube_key)
 
             if video_analysis.get("error"):
                 st.error(f"Video analysis failed: {video_analysis['error']}")
