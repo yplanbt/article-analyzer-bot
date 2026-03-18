@@ -125,7 +125,7 @@ def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
     # Get transcript as fallback/supplement
     transcript = get_youtube_transcript(video_id)
 
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
 
     prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation purposes.
 
