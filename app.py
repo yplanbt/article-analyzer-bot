@@ -16,6 +16,10 @@ from sheets_client import (
 from article_scraper import scrape_article
 from analyzer import analyze_article, analyze_found_article, EXCLUDED_STATES
 from article_finder import search_articles, CHARGE_CATEGORIES
+from title_generator import (
+    extract_video_id, get_youtube_transcript, analyze_video_with_gemini,
+    search_similar_videos, generate_titles, TOP_PERFORMING_TITLES,
+)
 
 load_dotenv()
 
@@ -258,6 +262,18 @@ with st.sidebar:
         type="password",
     )
 
+    gemini_key = st.text_input(
+        "Gemini API Key",
+        value=_get_secret("GEMINI_API_KEY", ""),
+        type="password",
+    )
+
+    youtube_key = st.text_input(
+        "YouTube API Key",
+        value=_get_secret("YOUTUBE_API_KEY", ""),
+        type="password",
+    )
+
     st.markdown("---")
     st.markdown("#### Sheets")
 
@@ -346,7 +362,7 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_finder, tab_analyzer = st.tabs(["  🔍  Finder  ", "  📊  Analyzer  "])
+tab_finder, tab_analyzer, tab_titles = st.tabs(["  🔍  Finder  ", "  📊  Analyzer  ", "  🎬  Title Generator  "])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1: ARTICLE FINDER
@@ -897,3 +913,108 @@ with tab_analyzer:
         s4.metric("Skipped", skip_count)
         st.success("Analysis complete! Results written to your Google Sheet.")
         st.balloons()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3: TITLE GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_titles:
+    if not gemini_key or not youtube_key:
+        st.info("Add your **Gemini API Key** and **YouTube API Key** in the sidebar to enable the Title Generator.")
+    else:
+        st.markdown("##### Paste your YouTube video link")
+
+        video_url = st.text_input(
+            "YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=... or unlisted link",
+            label_visibility="collapsed",
+        )
+
+        col_num, col_spacer = st.columns([1, 2])
+        with col_num:
+            num_titles = st.slider("Number of titles", min_value=5, max_value=15, value=10)
+
+        st.markdown("")
+
+        if st.button("🎬  Generate Titles", type="primary", use_container_width=True, disabled=not video_url.strip()):
+            video_id = extract_video_id(video_url.strip())
+            if not video_id:
+                st.error("Invalid YouTube URL. Please paste a valid YouTube link.")
+                st.stop()
+
+            # ── Step 1: Analyze the video ────────────────────────────────
+            st.markdown("---")
+            st.markdown("##### Step 1 — Understanding your video")
+            with st.spinner("Analyzing video with Gemini AI (transcript + context)..."):
+                video_analysis = analyze_video_with_gemini(video_url.strip(), gemini_key)
+
+            if video_analysis.get("error"):
+                st.error(f"Video analysis failed: {video_analysis['error']}")
+                st.stop()
+
+            with st.expander("Video breakdown", expanded=False):
+                st.markdown(f"**What happened:** {video_analysis.get('what_happened', 'N/A')}")
+                st.markdown(f"**Severity:** {video_analysis.get('severity', '?')}/10")
+                st.markdown(f"**Similar to:** {video_analysis.get('similar_to', 'N/A')}")
+                if video_analysis.get("key_moments"):
+                    st.markdown("**Key moments:**")
+                    for moment in video_analysis["key_moments"]:
+                        st.markdown(f"- {moment}")
+                if video_analysis.get("clickbait_angles"):
+                    st.markdown("**Best angles:**")
+                    for angle in video_analysis["clickbait_angles"]:
+                        st.markdown(f"- {angle}")
+
+            # ── Step 2: Find similar videos ──────────────────────────────
+            st.markdown("##### Step 2 — Researching similar viral videos")
+            with st.spinner("Searching YouTube for top-performing similar videos..."):
+                similar_videos = search_similar_videos(video_analysis, youtube_key)
+
+            st.caption(f"Found **{len(similar_videos)}** similar videos for reference")
+
+            with st.expander(f"Similar videos ({len(similar_videos)})", expanded=False):
+                for sv in similar_videos[:10]:
+                    st.markdown(f"- **{sv['title']}** — {sv['views']:,} views ({sv['channel']})")
+
+            # ── Step 3: Generate titles ──────────────────────────────────
+            st.markdown("##### Step 3 — Generating titles")
+            with st.spinner("Claude is crafting optimized titles..."):
+                titles = generate_titles(
+                    video_analysis=video_analysis,
+                    similar_titles=similar_videos,
+                    anthropic_key=anthropic_key,
+                    num_titles=num_titles,
+                )
+
+            if titles and titles[0].get("title", "").startswith("Error"):
+                st.error(titles[0]["title"])
+                st.stop()
+
+            st.markdown("---")
+            st.markdown("##### Your Titles")
+            st.caption("Ranked by predicted performance (highest confidence first)")
+
+            for i, t in enumerate(titles):
+                confidence = t.get("confidence", 0)
+                # Color code by confidence
+                if confidence >= 8:
+                    badge = "🟢"
+                elif confidence >= 6:
+                    badge = "🟡"
+                else:
+                    badge = "🔴"
+
+                col_title, col_conf = st.columns([5, 1])
+                with col_title:
+                    st.markdown(f"**{i+1}. {t['title']}**")
+                    st.caption(f"Structure: {t.get('structure', '—')} · Hook: {t.get('hook', '—')}")
+                with col_conf:
+                    st.markdown(f"### {badge} {confidence}/10")
+
+                if i < len(titles) - 1:
+                    st.markdown("<hr style='margin: 8px 0; opacity: 0.1;'>", unsafe_allow_html=True)
+
+            # Copy-friendly list
+            st.markdown("---")
+            with st.expander("Copy-paste list", expanded=True):
+                title_list = "\n".join(f"{i+1}. {t['title']}" for i, t in enumerate(titles))
+                st.code(title_list, language=None)
