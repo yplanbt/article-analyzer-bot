@@ -2,6 +2,9 @@
 
 import os
 import time
+import hashlib
+import hmac
+from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
@@ -15,6 +18,10 @@ from analyzer import analyze_article
 
 load_dotenv()
 
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+SESSION_TIMEOUT_HOURS = 12
+
 
 def _get_secret(key: str, default: str = "") -> str:
     """Get a config value from Streamlit secrets, env vars, or default."""
@@ -24,6 +31,11 @@ def _get_secret(key: str, default: str = "") -> str:
         return os.getenv(key, default)
 
 
+def _check_password(input_pw: str, stored_pw: str) -> bool:
+    """Constant-time password comparison to prevent timing attacks."""
+    return hmac.compare_digest(input_pw.encode(), stored_pw.encode())
+
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Article Analyzer Bot", page_icon="📰", layout="wide")
 
@@ -31,19 +43,52 @@ st.set_page_config(page_title="Article Analyzer Bot", page_icon="📰", layout="
 APP_PASSWORD = _get_secret("APP_PASSWORD", "")
 
 if APP_PASSWORD:
+    # Initialize session state
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
+    if "login_attempts" not in st.session_state:
+        st.session_state.login_attempts = 0
+    if "lockout_until" not in st.session_state:
+        st.session_state.lockout_until = None
+    if "auth_time" not in st.session_state:
+        st.session_state.auth_time = None
+
+    # Check session timeout
+    if st.session_state.authenticated and st.session_state.auth_time:
+        if datetime.now() - st.session_state.auth_time > timedelta(hours=SESSION_TIMEOUT_HOURS):
+            st.session_state.authenticated = False
+            st.session_state.auth_time = None
 
     if not st.session_state.authenticated:
         st.title("🔒 Article Analyzer Bot")
+
+        # Check lockout
+        if st.session_state.lockout_until and datetime.now() < st.session_state.lockout_until:
+            remaining = (st.session_state.lockout_until - datetime.now()).seconds // 60 + 1
+            st.error(f"Too many failed attempts. Locked out for {remaining} more minute(s).")
+            st.stop()
+        elif st.session_state.lockout_until:
+            # Lockout expired, reset
+            st.session_state.lockout_until = None
+            st.session_state.login_attempts = 0
+
         st.markdown("Enter the password to access this app.")
         password_input = st.text_input("Password", type="password")
+
         if st.button("Login", type="primary"):
-            if password_input == APP_PASSWORD:
+            if _check_password(password_input, APP_PASSWORD):
                 st.session_state.authenticated = True
+                st.session_state.login_attempts = 0
+                st.session_state.auth_time = datetime.now()
                 st.rerun()
             else:
-                st.error("Incorrect password.")
+                st.session_state.login_attempts += 1
+                remaining = MAX_LOGIN_ATTEMPTS - st.session_state.login_attempts
+                if remaining <= 0:
+                    st.session_state.lockout_until = datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)
+                    st.error(f"Too many failed attempts. Locked out for {LOCKOUT_MINUTES} minutes.")
+                else:
+                    st.error(f"Incorrect password. {remaining} attempt(s) remaining.")
         st.stop()
 
 st.title("📰 Article Analyzer Bot")
