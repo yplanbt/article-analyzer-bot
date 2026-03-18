@@ -223,30 +223,30 @@ Return ONLY valid JSON:
 
 
 def _call_gemini_rest(api_key: str, prompt: str) -> dict:
-    """Call Gemini API directly via REST, bypassing SDK issues."""
+    """Call Gemini API directly via REST, trying multiple models."""
     import requests as req
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    base = "https://generativelanguage.googleapis.com"
+    endpoints = [
+        f"{base}/v1beta/models/gemini-2.0-flash:generateContent",
+        f"{base}/v1beta/models/gemini-1.5-flash:generateContent",
+        f"{base}/v1beta/models/gemini-pro:generateContent",
+    ]
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    resp = req.post(url, json=payload, timeout=120)
+    errors = []
 
-    if resp.status_code != 200:
-        # Try v1 endpoint as fallback
-        url_v1 = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key={api_key}"
-        resp = req.post(url_v1, json=payload, timeout=120)
-        if resp.status_code != 200:
-            # Try gemini-1.5-flash as last resort
-            url_fallback = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
-            resp = req.post(url_fallback, json=payload, timeout=120)
-            if resp.status_code != 200:
-                return {"error": f"{resp.status_code}: {resp.text[:500]}"}
+    for url in endpoints:
+        resp = req.post(f"{url}?key={api_key}", json=payload, timeout=120)
+        if resp.status_code == 200:
+            data = resp.json()
+            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            json_match = re.search(r'\{[\s\S]*\}', raw)
+            if json_match:
+                return json.loads(json_match.group())
+            return {"error": "No JSON in Gemini response", "raw": raw[:500]}
+        errors.append(f"{url.split('models/')[1].split(':')[0]}: {resp.status_code}")
 
-    data = resp.json()
-    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    json_match = re.search(r'\{[\s\S]*\}', raw)
-    if json_match:
-        return json.loads(json_match.group())
-    return {"error": "No JSON in Gemini response", "raw": raw[:500]}
+    return {"error": f"All Gemini models failed — {', '.join(errors)}. Check that the Generative Language API is enabled for your API key at https://console.cloud.google.com/apis"}
 
 
 def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str = None) -> dict:
