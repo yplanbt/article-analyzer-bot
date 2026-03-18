@@ -128,7 +128,7 @@ def get_youtube_transcript(video_id: str) -> str:
 def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
     """Use Gemini to analyze the actual video file — downloads, uploads to Gemini, gets real analysis."""
     from google import genai
-    import subprocess
+    from pytubefix import YouTube
     import tempfile
     import os
     import time
@@ -140,28 +140,22 @@ def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
 
     client = genai.Client(api_key=gemini_key)
 
-    # Step 1: Download video with yt-dlp (lowest quality to save time/bandwidth)
-    tmp_path = tempfile.mktemp(suffix='.mp4')
+    # Step 1: Download video with pytubefix (lowest quality to save bandwidth)
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = None
     try:
-        dl_result = subprocess.run(
-            ['yt-dlp', '-f', 'worst[ext=mp4]', '-o', tmp_path,
-             f'https://www.youtube.com/watch?v={video_id}'],
-            capture_output=True, text=True, timeout=300
-        )
-        if not os.path.exists(tmp_path):
-            # Fallback: try without format filter
-            subprocess.run(
-                ['yt-dlp', '-f', 'mp4', '-o', tmp_path,
-                 f'https://www.youtube.com/watch?v={video_id}'],
-                capture_output=True, text=True, timeout=300
-            )
-    except subprocess.TimeoutExpired:
-        return {"error": "Video download timed out (5 min limit)"}
-    except FileNotFoundError:
-        return {"error": "yt-dlp is not installed"}
+        yt = YouTube(f'https://www.youtube.com/watch?v={video_id}')
+        stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').first()
+        if not stream:
+            stream = yt.streams.filter(file_extension='mp4').order_by('resolution').first()
+        if not stream:
+            return {"error": "No downloadable MP4 stream found for this video"}
+        tmp_path = stream.download(output_path=tmp_dir, filename='video.mp4')
+    except Exception as e:
+        return {"error": f"Failed to download video: {e}"}
 
-    if not os.path.exists(tmp_path):
-        return {"error": f"Failed to download video: {dl_result.stderr[:200]}"}
+    if not tmp_path or not os.path.exists(tmp_path):
+        return {"error": "Video download failed — file not created"}
 
     file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
 
@@ -183,9 +177,14 @@ def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
     except Exception as e:
         return {"error": f"Gemini upload failed: {e}"}
     finally:
-        # Clean up downloaded file
-        if os.path.exists(tmp_path):
+        # Clean up downloaded file and temp dir
+        if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+        if os.path.exists(tmp_dir):
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
 
     # Step 3: Analyze the actual video with Gemini
     prompt = """You are analyzing a bodycam/crime YouTube video for title generation. Watch the ENTIRE video carefully.
