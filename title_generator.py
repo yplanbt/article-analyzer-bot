@@ -222,30 +222,29 @@ Return ONLY valid JSON:
 """
 
 
-def _call_gemini_rest(api_key: str, prompt: str) -> dict:
-    """Call Gemini API directly via REST, trying multiple models."""
+def _call_gemini_rest(api_key: str, prompt: str, video_url: str = None) -> dict:
+    """Call Gemini API directly via REST. Optionally include a YouTube video URL."""
     import requests as req
 
     base = "https://generativelanguage.googleapis.com"
-    endpoints = [
-        f"{base}/v1beta/models/gemini-2.5-flash:generateContent",
-        f"{base}/v1beta/models/gemini-2.0-flash:generateContent",
-    ]
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    errors = []
+    url = f"{base}/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
 
-    for url in endpoints:
-        resp = req.post(f"{url}?key={api_key}", json=payload, timeout=120)
-        if resp.status_code == 200:
-            data = resp.json()
-            raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                return json.loads(json_match.group())
-            return {"error": "No JSON in Gemini response", "raw": raw[:500]}
-        errors.append(f"{url.split('models/')[1].split(':')[0]}: {resp.status_code}")
+    parts = []
+    if video_url:
+        parts.append({"fileData": {"fileUri": video_url, "mimeType": "video/*"}})
+    parts.append({"text": prompt})
+    payload = {"contents": [{"parts": parts}]}
 
-    return {"error": f"All Gemini models failed — {', '.join(errors)}. Check that the Generative Language API is enabled for your API key at https://console.cloud.google.com/apis"}
+    resp = req.post(url, json=payload, timeout=180)
+    if resp.status_code != 200:
+        return {"error": f"{resp.status_code}: {resp.text[:500]}"}
+
+    data = resp.json()
+    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    json_match = re.search(r'\{[\s\S]*\}', raw)
+    if json_match:
+        return json.loads(json_match.group())
+    return {"error": "No JSON in Gemini response", "raw": raw[:500]}
 
 
 def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str = None) -> dict:
@@ -272,20 +271,20 @@ def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str 
         except Exception as e:
             return {"error": str(e)}
     else:
-        # Transcript library blocked — analyze using metadata only
+        # Transcript library blocked — let Gemini process the YouTube URL directly
         fallback_prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation.
 
-Based on the metadata below, provide your best analysis.
+Watch this video carefully. Focus on the DIALOGUE and what people say.
 
 VIDEO METADATA:
 - Original title: {metadata.get('title', 'Unknown')}
 - Channel: {metadata.get('channel', 'Unknown')}
 - Description: {metadata.get('description', 'N/A')[:500]}
 
-Based on the metadata, provide:
+Based on the video, provide:
 
 1. **WHAT HAPPENED** — Full incident description. Names, charges, what police did, how it ended.
-2. **KEY DRAMATIC MOMENTS** — Most shocking/tense moments based on what's described.
+2. **KEY DRAMATIC MOMENTS** — Most shocking/tense moments. Quote exact words from dialogue.
 3. **PEOPLE INVOLVED** — Each person: role, name if stated, gender, age if mentioned, behavior/attitude.
 4. **SEVERITY** — 1-10 based on what happened.
 5. **CLICKBAIT ANGLES** — What aspects drive the most curiosity?
@@ -295,7 +294,10 @@ Return ONLY valid JSON:
 {{"what_happened": "...", "key_moments": ["...", "..."], "people": [{{"role": "...", "description": "..."}}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}}
 """
         try:
-            return _call_gemini_rest(gemini_key, fallback_prompt)
+            return _call_gemini_rest(
+                gemini_key, fallback_prompt,
+                video_url=f"https://www.youtube.com/watch?v={video_id}",
+            )
         except Exception as e:
             return {"error": str(e)}
 
