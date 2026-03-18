@@ -168,21 +168,27 @@ def get_youtube_transcript(video_id: str) -> str:
 
 def _get_video_metadata(video_id: str, youtube_key: str) -> dict:
     """Get video title, description, and tags from YouTube API."""
+    import requests as req
+
+    # Use REST API directly to avoid googleapiclient issues on cloud
+    url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {"part": "snippet", "id": video_id, "key": youtube_key}
     try:
-        from googleapiclient.discovery import build
-        youtube = build("youtube", "v3", developerKey=youtube_key)
-        resp = youtube.videos().list(part="snippet", id=video_id).execute()
-        if resp.get("items"):
-            snippet = resp["items"][0]["snippet"]
-            return {
-                "title": snippet.get("title", ""),
-                "description": snippet.get("description", "")[:2000],
-                "tags": snippet.get("tags", []),
-                "channel": snippet.get("channelTitle", ""),
-            }
-    except Exception:
-        pass
-    return {}
+        resp = req.get(url, params=params, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("items"):
+                snippet = data["items"][0]["snippet"]
+                return {
+                    "title": snippet.get("title", ""),
+                    "description": snippet.get("description", "")[:2000],
+                    "tags": snippet.get("tags", []),
+                    "channel": snippet.get("channelTitle", ""),
+                    "_error": None,
+                }
+        return {"_error": f"YouTube API {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"_error": f"YouTube API error: {e}"}
 
 
 def _build_analysis_prompt(transcript: str, metadata: dict) -> str:
@@ -222,18 +228,13 @@ Return ONLY valid JSON:
 """
 
 
-def _call_gemini_rest(api_key: str, prompt: str, video_url: str = None) -> dict:
-    """Call Gemini API directly via REST. Optionally include a YouTube video URL."""
+def _call_gemini_rest(api_key: str, prompt: str) -> dict:
+    """Call Gemini API via REST (text-only)."""
     import requests as req
 
     base = "https://generativelanguage.googleapis.com"
     url = f"{base}/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-
-    parts = []
-    if video_url:
-        parts.append({"fileData": {"fileUri": video_url, "mimeType": "video/*"}})
-    parts.append({"text": prompt})
-    payload = {"contents": [{"parts": parts}]}
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     resp = req.post(url, json=payload, timeout=180)
     if resp.status_code != 200:
@@ -271,21 +272,25 @@ def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str 
         except Exception as e:
             return {"error": str(e)}
     else:
-        # Transcript library blocked — let Gemini process the YouTube URL directly
-        fallback_prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation.
+        # Transcript library blocked — use metadata-only analysis
+        if metadata.get("_error") or not metadata.get("title"):
+            return {"error": f"Transcript unavailable on cloud and YouTube metadata fetch failed: {metadata.get('_error', 'no metadata')}. Check your YouTube API Key."}
 
-Watch this video carefully. Focus on the DIALOGUE and what people say.
+        fallback_prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation.
+The transcript is unavailable, so analyze based on the metadata below. Use the title and description to infer as much as possible about the incident.
 
 VIDEO METADATA:
 - Original title: {metadata.get('title', 'Unknown')}
 - Channel: {metadata.get('channel', 'Unknown')}
-- Description: {metadata.get('description', 'N/A')[:500]}
+- Tags: {', '.join(metadata.get('tags', [])[:20])}
+- Full description:
+{metadata.get('description', 'N/A')}
 
-Based on the video, provide:
+Based on the metadata, provide your best analysis:
 
-1. **WHAT HAPPENED** — Full incident description. Names, charges, what police did, how it ended.
-2. **KEY DRAMATIC MOMENTS** — Most shocking/tense moments. Quote exact words from dialogue.
-3. **PEOPLE INVOLVED** — Each person: role, name if stated, gender, age if mentioned, behavior/attitude.
+1. **WHAT HAPPENED** — Infer the full incident from the title and description. Names, charges, what police did, how it ended.
+2. **KEY DRAMATIC MOMENTS** — Most likely dramatic moments based on what's described.
+3. **PEOPLE INVOLVED** — Each person mentioned: role, name if stated, behavior/attitude.
 4. **SEVERITY** — 1-10 based on what happened.
 5. **CLICKBAIT ANGLES** — What aspects drive the most curiosity?
 6. **SIMILAR TO** — What type of viral bodycam content is this?
@@ -294,10 +299,7 @@ Return ONLY valid JSON:
 {{"what_happened": "...", "key_moments": ["...", "..."], "people": [{{"role": "...", "description": "..."}}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}}
 """
         try:
-            return _call_gemini_rest(
-                gemini_key, fallback_prompt,
-                video_url=f"https://www.youtube.com/watch?v={video_id}",
-            )
+            return _call_gemini_rest(gemini_key, fallback_prompt)
         except Exception as e:
             return {"error": str(e)}
 
