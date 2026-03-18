@@ -918,6 +918,10 @@ with tab_analyzer:
 # TAB 3: TITLE GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_titles:
+    if is_cloud:
+        st.warning("**Title Generator requires localhost.** It downloads and uploads the actual video to Gemini for accurate visual analysis. Run the app locally: `streamlit run app.py`")
+        st.stop()
+
     if not gemini_key or not youtube_key:
         st.info("Add your **Gemini API Key** and **YouTube API Key** in the sidebar to enable the Title Generator.")
     else:
@@ -945,7 +949,7 @@ with tab_titles:
             st.markdown("---")
             st.markdown("##### Step 1 — Understanding your video")
             with st.spinner("Analyzing video with Gemini AI (transcript + context)..."):
-                video_analysis = analyze_video_with_gemini(video_url.strip(), gemini_key, youtube_key)
+                video_analysis = analyze_video_with_gemini(video_url.strip(), gemini_key)
 
             if video_analysis.get("error"):
                 st.error(f"Video analysis failed: {video_analysis['error']}")

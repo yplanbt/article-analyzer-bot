@@ -125,85 +125,110 @@ def get_youtube_transcript(video_id: str) -> str:
         return f"[Transcript unavailable: {e}]"
 
 
-def _get_video_metadata(video_id: str, youtube_key: str = None) -> dict:
-    """Get video title, description, and tags from YouTube API."""
-    if not youtube_key:
-        return {}
-    try:
-        from googleapiclient.discovery import build
-        youtube = build("youtube", "v3", developerKey=youtube_key)
-        resp = youtube.videos().list(part="snippet", id=video_id).execute()
-        if resp.get("items"):
-            snippet = resp["items"][0]["snippet"]
-            return {
-                "title": snippet.get("title", ""),
-                "description": snippet.get("description", "")[:2000],
-                "tags": snippet.get("tags", []),
-                "channel": snippet.get("channelTitle", ""),
-            }
-    except Exception:
-        pass
-    return {}
-
-
-def analyze_video_with_gemini(video_url: str, gemini_key: str, youtube_key: str = None) -> dict:
-    """Analyze video using transcript + metadata. Gemini analyzes ONLY what's in the transcript."""
+def analyze_video_with_gemini(video_url: str, gemini_key: str) -> dict:
+    """Download video with yt-dlp, upload to Gemini, get full visual + audio analysis."""
     from google import genai
+    import subprocess
+    import tempfile
+    import os
+    import time
 
     video_id = extract_video_id(video_url)
     if not video_id:
         return {"error": "Invalid YouTube URL"}
 
-    # Get transcript (the actual dialogue/narration)
-    transcript = get_youtube_transcript(video_id)
-    if transcript.startswith("[Transcript unavailable"):
-        return {"error": f"Cannot analyze video — {transcript}"}
-
-    # Get video metadata from YouTube API
-    metadata = _get_video_metadata(video_id, youtube_key)
-
     client = genai.Client(api_key=gemini_key)
 
-    prompt = f"""You are analyzing a bodycam/crime YouTube video for title generation purposes.
+    # Step 1: Download video with yt-dlp (lowest quality MP4)
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, "video.mp4")
 
-CRITICAL RULES:
-- You can ONLY see the transcript below. You CANNOT see the video.
-- ONLY describe what is explicitly stated in the transcript. Do NOT imagine or hallucinate any visual details.
-- If someone says "she stabbed me", report that. Do NOT invent details about weapons, injuries, or scenes that aren't mentioned.
-- Use EXACT quotes and names from the transcript when possible.
+    try:
+        result = subprocess.run(
+            ['yt-dlp', '-f', 'worst[ext=mp4]', '-o', tmp_path,
+             f'https://www.youtube.com/watch?v={video_id}'],
+            capture_output=True, text=True, timeout=300
+        )
+        if not os.path.exists(tmp_path):
+            # Fallback: any mp4
+            subprocess.run(
+                ['yt-dlp', '-S', '+size', '--recode-video', 'mp4', '-o', tmp_path,
+                 f'https://www.youtube.com/watch?v={video_id}'],
+                capture_output=True, text=True, timeout=300
+            )
+    except FileNotFoundError:
+        return {"error": "yt-dlp is not installed. Title Generator requires local setup — run the app on localhost, not Streamlit Cloud."}
+    except subprocess.TimeoutExpired:
+        return {"error": "Video download timed out (5 min limit)"}
 
-VIDEO METADATA:
-- Original title: {metadata.get('title', 'Unknown')}
-- Channel: {metadata.get('channel', 'Unknown')}
-- Description: {metadata.get('description', 'N/A')[:500]}
+    if not os.path.exists(tmp_path):
+        return {"error": f"Failed to download video. Make sure yt-dlp is installed: pip install yt-dlp"}
 
-FULL TRANSCRIPT:
-{transcript}
+    file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
 
-Based STRICTLY on the transcript above, provide:
+    # Step 2: Upload to Gemini Files API
+    try:
+        uploaded = client.files.upload(file=tmp_path)
 
-1. **WHAT HAPPENED** — Describe the full incident using ONLY information from the transcript. Use real names if mentioned. What was the crime? What did police do? How did it end?
+        wait_start = time.time()
+        while uploaded.state.name == 'PROCESSING':
+            if time.time() - wait_start > 300:
+                return {"error": "Gemini video processing timed out"}
+            time.sleep(3)
+            uploaded = client.files.get(name=uploaded.name)
 
-2. **KEY DRAMATIC MOMENTS** — What are the most shocking or tense moments from the DIALOGUE? Quote exact words when possible.
+        if uploaded.state.name != 'ACTIVE':
+            return {"error": f"Gemini file processing failed: {uploaded.state.name}"}
 
-3. **PEOPLE INVOLVED** — List each person mentioned: their role, name if stated, gender, behavior/attitude based on their dialogue.
+    except Exception as e:
+        return {"error": f"Gemini upload failed: {e}"}
+    finally:
+        # Clean up
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
 
-4. **SEVERITY LEVEL** — 1-10, based on the charges/incident described in the transcript.
+    # Step 3: Gemini watches the actual video
+    prompt = """You are analyzing a bodycam/crime YouTube video for title generation. Watch the ENTIRE video carefully.
 
-5. **CLICKBAIT ANGLES** — What aspects would generate the most curiosity and clicks?
+BE EXTREMELY ACCURATE. Only describe what you actually see and hear. Do NOT make anything up.
+
+Provide a detailed breakdown:
+
+1. **WHAT HAPPENED** — Describe the full incident in detail. Who was involved (use real names if mentioned)? What was the crime? What did police do? How did it escalate? How did it end?
+
+2. **KEY DRAMATIC MOMENTS** — What are the most shocking, tense, or emotionally charged moments? Include timestamps if possible.
+
+3. **PEOPLE INVOLVED** — Describe each person: their role (suspect, officer, victim, bystander), name if mentioned, approximate age, gender, behavior, attitude.
+
+4. **SEVERITY LEVEL** — On a scale of 1-10, how shocking/intense is this incident? Why?
+
+5. **CLICKBAIT ANGLES** — What aspects of this story would generate the most curiosity and clicks?
+   - What's the most intriguing single detail?
+   - What's the "twist" or unexpected element?
+   - What emotional reaction will viewers have?
 
 6. **SIMILAR TO** — What type of viral bodycam content does this remind you of?
 
-Return ONLY valid JSON:
-{{"what_happened": "...", "key_moments": ["...", "..."], "people": [{{"role": "...", "description": "..."}}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}}
+Return your analysis as JSON:
+{"what_happened": "...", "key_moments": ["...", "..."], "people": [{"role": "...", "description": "..."}], "severity": 8, "clickbait_angles": ["...", "..."], "similar_to": "...", "one_line_summary": "..."}
 """
 
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=prompt
+            contents=[uploaded, prompt]
         )
         raw = response.text.strip()
+
+        # Clean up uploaded file from Gemini
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
 
         json_match = re.search(r'\{[\s\S]*\}', raw)
         if json_match:
