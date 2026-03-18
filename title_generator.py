@@ -228,9 +228,8 @@ def _call_gemini_rest(api_key: str, prompt: str) -> dict:
 
     base = "https://generativelanguage.googleapis.com"
     endpoints = [
+        f"{base}/v1beta/models/gemini-2.5-flash:generateContent",
         f"{base}/v1beta/models/gemini-2.0-flash:generateContent",
-        f"{base}/v1beta/models/gemini-1.5-flash:generateContent",
-        f"{base}/v1beta/models/gemini-pro:generateContent",
     ]
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     errors = []
