@@ -15,8 +15,10 @@ from sheets_client import (
     write_foia_request, update_foia_row, get_existing_foia_urls,
 )
 from foia_requester import (
-    generate_foia_request_ai, generate_request_id, send_email_smtp,
-    draft_follow_up, get_requests_needing_followup, search_pd_contact,
+    generate_foia_request_ai, generate_foia_request_simple,
+    generate_request_id, send_email_smtp,
+    draft_follow_up, get_requests_needing_followup,
+    search_pd_contact_web, process_single_request,
 )
 from pd_database import (
     get_pd_database, lookup_department, add_department,
@@ -959,7 +961,7 @@ with tab_foia:
 
         # ── Section A: Create New Requests ────────────────────────────────
         st.markdown("##### Create New Requests")
-        st.caption("Articles with FOIA score ≥ 7 from your Working Sheet, not yet requested.")
+        st.caption("Articles with FOIA score ≥ 7 from your Working Sheet. Auto-finds PD contact, generates letter, and sends.")
 
         try:
             working_rows = get_all_rows(service, working_sheet_id, working_tab)
@@ -1007,6 +1009,75 @@ with tab_foia:
             if "pd_suggestions" not in st.session_state:
                 st.session_state.pd_suggestions = {}
 
+            # ── FULLY AUTOMATED: Process All ──
+            can_auto = bool(foia_email and foia_email_password and serpapi_key)
+            if not can_auto:
+                missing_cfg = []
+                if not foia_email:
+                    missing_cfg.append("FOIA Email")
+                if not foia_email_password:
+                    missing_cfg.append("FOIA Email App Password")
+                if not serpapi_key:
+                    missing_cfg.append("SerpAPI Key")
+                st.warning(f"Set {', '.join(missing_cfg)} in sidebar to enable full automation.")
+
+            if st.button(
+                f"Process All {len(requestable)} Requests Automatically",
+                type="primary",
+                use_container_width=True,
+                disabled=not can_auto,
+            ):
+                progress_bar = st.progress(0)
+                status_container = st.container()
+                results_summary = {"sent": 0, "portal_draft": 0, "failed": 0}
+
+                for i, article in enumerate(requestable):
+                    progress_bar.progress((i + 1) / len(requestable))
+                    with status_container:
+                        st.caption(f"Processing {i+1}/{len(requestable)}: **{article['suspect_name']}** — {article['police_dept']}, {article['state']}")
+
+                    # Scrape article for context
+                    try:
+                        scraped = scrape_article(article["url"])
+                        article_text = scraped.get("text", "") if scraped else ""
+                    except Exception:
+                        article_text = ""
+
+                    result = process_single_request(
+                        article=article,
+                        article_text=article_text,
+                        sender_name=sender_name,
+                        anthropic_key=anthropic_key,
+                        serpapi_key=serpapi_key,
+                        foia_email=foia_email,
+                        foia_email_password=foia_email_password,
+                        pd_db=pd_db,
+                        service=service,
+                        foia_sheet_id=foia_sheet_id,
+                    )
+
+                    results_summary[result["status"]] = results_summary.get(result["status"], 0) + 1
+                    with status_container:
+                        if result["status"] == "sent":
+                            st.success(f"{article['suspect_name']}: {result['details']}")
+                        elif result["status"] == "portal_draft":
+                            st.info(f"{article['suspect_name']}: {result['details']}")
+                        else:
+                            st.error(f"{article['suspect_name']}: {result['details']}")
+
+                # Final summary
+                st.markdown("---")
+                sum_cols = st.columns(3)
+                sum_cols[0].metric("Sent via Email", results_summary.get("sent", 0))
+                sum_cols[1].metric("Portal (Manual)", results_summary.get("portal_draft", 0))
+                sum_cols[2].metric("Failed", results_summary.get("failed", 0))
+                if results_summary.get("sent", 0) > 0:
+                    st.balloons()
+
+            st.markdown("---")
+            st.markdown("##### Individual Requests")
+            st.caption("Or process articles one at a time below:")
+
             for idx, article in enumerate(requestable):
                 dept_name = article["police_dept"]
                 art_state = article["state"]
@@ -1030,11 +1101,11 @@ with tab_foia:
                         st.warning(f"**{dept_name}** not in database yet.")
                         contact = ""
 
-                        # AI-powered PD contact search
+                        # AI-powered PD contact search via web
                         pd_sug_key = f"pd_sug_{dept_name}_{art_state}"
                         if st.button(f"Search for {dept_name} contact info", key=f"search_pd_{idx}"):
-                            with st.spinner("Searching with AI..."):
-                                suggestion = search_pd_contact(dept_name, art_state, anthropic_key)
+                            with st.spinner("Searching the web for contact info..."):
+                                suggestion = search_pd_contact_web(dept_name, art_state, serpapi_key, anthropic_key)
                                 st.session_state.pd_suggestions[pd_sug_key] = suggestion
 
                         if pd_sug_key in st.session_state.pd_suggestions:

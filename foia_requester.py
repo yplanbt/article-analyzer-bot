@@ -138,33 +138,245 @@ Rules:
     return {"subject": subject, "body": body}
 
 
-def search_pd_contact(police_dept: str, state: str, anthropic_key: str) -> dict:
-    """Use Claude to suggest how to contact a police department for records requests."""
+def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthropic_key: str) -> dict:
+    """Search the web for a PD's FOIA contact info, then have Claude extract it."""
+    import json, re, requests as req
+
+    # Step 1: Search Google via SerpAPI for the PD's records request page
+    queries = [
+        f"{police_dept} {state} public records request body camera FOIA email",
+        f"{police_dept} {state} records custodian FOIA portal",
+    ]
+    all_snippets = []
+    all_links = []
+
+    for query in queries:
+        try:
+            resp = req.get("https://serpapi.com/search", params={
+                "q": query, "api_key": serpapi_key, "num": 5,
+            }, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for r in data.get("organic_results", [])[:5]:
+                    snippet = f"Title: {r.get('title', '')} | URL: {r.get('link', '')} | Snippet: {r.get('snippet', '')}"
+                    all_snippets.append(snippet)
+                    all_links.append(r.get("link", ""))
+        except Exception:
+            pass
+
+    if not all_snippets:
+        # Fallback to Claude's knowledge only
+        return _search_pd_contact_ai_only(police_dept, state, anthropic_key)
+
+    # Step 2: Have Claude analyze the search results
+    client = anthropic.Anthropic(api_key=anthropic_key)
+    search_text = "\n".join(all_snippets[:10])
+
+    prompt = f"""I need to find how to submit a FOIA / public records request for body-worn camera footage to: {police_dept}, {state}
+
+Here are Google search results:
+{search_text}
+
+Based on these results, determine:
+1. The BEST method to submit a records request (email is preferred if available, as it's automatable)
+2. The exact email address for records/FOIA requests
+3. If they use an online portal (GovQA, NextRequest, JustFOIA), provide the URL
+4. Any important notes (fees, turnaround time, specific form requirements)
+
+IMPORTANT:
+- If you find an email, prefer that as the method (even if they also have a portal)
+- Extract REAL email addresses and URLs from the search results, don't guess
+- If no email found in results, check if common patterns apply (records@city.gov, etc.)
+
+Return ONLY valid JSON:
+{{"method": "email" or "portal" or "both", "email": "exact email address or empty", "portal_url": "exact URL or empty", "portal_type": "govqa/nextrequest/justfoia/other/none", "notes": "important details about their process", "confidence": "high/medium/low"}}"""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=400,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text.strip()
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if match:
+        result = json.loads(match.group())
+        result["search_links"] = all_links[:3]
+        return result
+    return {"method": "email", "email": "", "portal_url": "", "notes": "Could not determine", "confidence": "low"}
+
+
+def _search_pd_contact_ai_only(police_dept: str, state: str, anthropic_key: str) -> dict:
+    """Fallback: use Claude's knowledge only when web search fails."""
+    import json, re
     client = anthropic.Anthropic(api_key=anthropic_key)
 
-    prompt = f"""I need to find the records request contact for: {police_dept}, {state}
+    prompt = f"""I need the records request contact for: {police_dept}, {state}
 
-Based on your knowledge, provide:
-1. The most likely email address for records/FOIA requests (many PDs use formats like records@cityPD.gov, foiarequests@city.gov, or publicrecords@city.us)
-2. Whether they likely use an online portal (GovQA, NextRequest, JustFOIA, or their own)
+Provide your best knowledge about:
+1. Their email for FOIA/records requests
+2. Whether they use GovQA, NextRequest, JustFOIA, or another portal
 3. The portal URL if known
 
 Return ONLY valid JSON:
-{{"method": "email" or "portal" or "both", "email": "best guess email or empty string", "portal_url": "URL or empty string", "portal_type": "govqa/nextrequest/justfoia/other/none", "notes": "any helpful info about this department's FOIA process"}}
-
-If you're not confident about the email, still provide your best guess based on common patterns for that city/county. Note that in the JSON."""
+{{"method": "email" or "portal" or "both", "email": "best guess email", "portal_url": "URL or empty", "portal_type": "govqa/nextrequest/justfoia/other/none", "notes": "any info", "confidence": "low"}}"""
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
-    import json, re
     raw = response.content[0].text.strip()
     match = re.search(r'\{[\s\S]*\}', raw)
     if match:
         return json.loads(match.group())
-    return {"method": "email", "email": "", "portal_url": "", "notes": "Could not determine contact info"}
+    return {"method": "email", "email": "", "portal_url": "", "notes": "Could not determine", "confidence": "low"}
+
+
+def process_single_request(
+    article: dict,
+    article_text: str,
+    sender_name: str,
+    anthropic_key: str,
+    serpapi_key: str,
+    foia_email: str,
+    foia_email_password: str,
+    pd_db: list,
+    service,
+    foia_sheet_id: str,
+) -> dict:
+    """Fully automated: find contact, generate letter, send it. Returns status dict."""
+    from pd_database import lookup_department, add_department
+    import time
+
+    dept_name = article["police_dept"]
+    state = article["state"]
+    result = {"article": article, "status": "pending", "details": ""}
+
+    # Step 1: Find department contact
+    pd_match = lookup_department(pd_db, dept_name, state)
+    if not pd_match or not (pd_match.get("Email Address") or pd_match.get("Portal URL")):
+        # Auto-search for contact info
+        contact_info = search_pd_contact_web(dept_name, state, serpapi_key, anthropic_key)
+
+        if contact_info.get("email") or contact_info.get("portal_url"):
+            # Auto-add to database
+            add_department(service, foia_sheet_id, {
+                "name": dept_name,
+                "state": state,
+                "method": contact_info.get("method", "email"),
+                "email": contact_info.get("email", ""),
+                "portal_url": contact_info.get("portal_url", ""),
+                "portal_type": contact_info.get("portal_type", ""),
+                "notes": contact_info.get("notes", ""),
+            })
+            pd_match = {
+                "Department Name": dept_name,
+                "State": state,
+                "Method": contact_info.get("method", "email"),
+                "Email Address": contact_info.get("email", ""),
+                "Portal URL": contact_info.get("portal_url", ""),
+            }
+        else:
+            result["status"] = "failed"
+            result["details"] = f"Could not find contact info for {dept_name}, {state}"
+            return result
+
+    # Step 2: Generate FOIA letter
+    if article_text:
+        letter = generate_foia_request_ai(
+            article_text=article_text,
+            suspect_name=article["suspect_name"],
+            incident_date=article["incident_date"],
+            police_dept=dept_name,
+            state=state,
+            sender_name=sender_name,
+            anthropic_key=anthropic_key,
+        )
+    else:
+        letter = generate_foia_request_simple(
+            suspect_name=article["suspect_name"],
+            incident_date=article["incident_date"],
+            police_dept=dept_name,
+            state=state,
+            sender_name=sender_name,
+        )
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    method = pd_match.get("Method", "email")
+    email_addr = pd_match.get("Email Address", "")
+    portal_url = pd_match.get("Portal URL", "")
+
+    # Step 3: Send via best available method
+    if email_addr and method in ("email", "both"):
+        # Send via email
+        send_result = send_email_smtp(
+            smtp_host="smtp.gmail.com",
+            smtp_port=587,
+            email=foia_email,
+            password=foia_email_password,
+            to_addr=email_addr,
+            subject=letter["subject"],
+            body=letter["body"],
+        )
+        if send_result["success"]:
+            from sheets_client import write_foia_request
+            write_foia_request(service, foia_sheet_id, {
+                "Request ID": generate_request_id(),
+                "Article URL": article["url"],
+                "Suspect Name": article["suspect_name"],
+                "Incident Date": article["incident_date"],
+                "Police Department": dept_name,
+                "State": state,
+                "FOIA Score": str(article.get("foia_score", "")),
+                "Request Method": "email",
+                "Contact Info": email_addr,
+                "Status": "Sent",
+                "Date Created": today,
+                "Date Sent": today,
+                "Last Follow-Up": "",
+                "Follow-Up Count": "0",
+                "Notes": "",
+                "Request Body": letter["body"],
+            })
+            result["status"] = "sent"
+            result["details"] = f"Emailed to {email_addr}"
+            result["method"] = "email"
+            result["letter"] = letter
+            time.sleep(1)  # Rate limit between emails
+        else:
+            result["status"] = "failed"
+            result["details"] = f"Email failed: {send_result['error']}"
+    elif portal_url:
+        # Can't auto-submit to portal — save as draft with portal info
+        from sheets_client import write_foia_request
+        write_foia_request(service, foia_sheet_id, {
+            "Request ID": generate_request_id(),
+            "Article URL": article["url"],
+            "Suspect Name": article["suspect_name"],
+            "Incident Date": article["incident_date"],
+            "Police Department": dept_name,
+            "State": state,
+            "FOIA Score": str(article.get("foia_score", "")),
+            "Request Method": "portal",
+            "Contact Info": portal_url,
+            "Status": "Draft",
+            "Date Created": today,
+            "Date Sent": "",
+            "Last Follow-Up": "",
+            "Follow-Up Count": "0",
+            "Notes": f"Submit via portal: {portal_url}",
+            "Request Body": letter["body"],
+        })
+        result["status"] = "portal_draft"
+        result["details"] = f"Portal-only: {portal_url} — letter saved as draft"
+        result["method"] = "portal"
+        result["portal_url"] = portal_url
+        result["letter"] = letter
+    else:
+        result["status"] = "failed"
+        result["details"] = f"No email or portal found for {dept_name}"
+
+    return result
 
 
 def generate_request_id() -> str:
