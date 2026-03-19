@@ -11,7 +11,16 @@ from dotenv import load_dotenv
 from sheets_client import (
     get_sheets_service, get_all_rows, get_master_data,
     check_duplicate, write_results_to_row, create_new_sheet,
-    append_rows_to_sheet,
+    append_rows_to_sheet, ensure_foia_headers, get_foia_requests,
+    write_foia_request, update_foia_row, get_existing_foia_urls,
+)
+from foia_requester import (
+    generate_foia_request, generate_request_id, send_email_smtp,
+    draft_follow_up, get_requests_needing_followup,
+)
+from pd_database import (
+    get_pd_database, lookup_department, add_department,
+    ensure_pd_db_headers,
 )
 from article_scraper import scrape_article
 from analyzer import analyze_article, analyze_found_article, EXCLUDED_STATES
@@ -289,6 +298,23 @@ with st.sidebar:
     )
     master_tab = st.text_input("Master Tab", value=_get_secret("MASTER_SHEET_TAB", "Sheet1"))
 
+    st.markdown("---")
+    st.markdown("#### FOIA Requests")
+
+    foia_sheet_id = st.text_input(
+        "FOIA Sheet ID",
+        value=_get_secret("FOIA_SHEET_ID", ""),
+    )
+    foia_email = st.text_input(
+        "FOIA Email Address",
+        value=_get_secret("FOIA_EMAIL", ""),
+    )
+    foia_email_password = st.text_input(
+        "FOIA Email App Password",
+        value=_get_secret("FOIA_EMAIL_PASSWORD", ""),
+        type="password",
+    )
+
 # ── Validation ───────────────────────────────────────────────────────────────
 missing = []
 if not anthropic_key:
@@ -362,7 +388,7 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_finder, tab_analyzer, tab_titles = st.tabs(["  🔍  Finder  ", "  📊  Analyzer  ", "  🎬  Title Generator  "])
+tab_finder, tab_analyzer, tab_foia, tab_titles = st.tabs(["  🔍  Finder  ", "  📊  Analyzer  ", "  📋  FOIA Requests  ", "  🎬  Title Generator  "])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1: ARTICLE FINDER
@@ -915,7 +941,315 @@ with tab_analyzer:
         st.balloons()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3: TITLE GENERATOR
+# TAB 3: FOIA REQUESTS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_foia:
+    if not foia_sheet_id:
+        st.info("Add your **FOIA Sheet ID** in the sidebar to get started.")
+    elif not anthropic_key:
+        st.info("Add your **Anthropic API Key** in the sidebar.")
+    else:
+        try:
+            service = get_sheets_service()
+            ensure_foia_headers(service, foia_sheet_id)
+            ensure_pd_db_headers(service, foia_sheet_id)
+        except Exception as e:
+            st.error(f"Failed to connect to FOIA sheet: {e}")
+            st.stop()
+
+        # ── Section A: Create New Requests ────────────────────────────────
+        st.markdown("##### Create New Requests")
+        st.caption("Articles with FOIA score ≥ 7 from your Working Sheet, not yet requested.")
+
+        try:
+            working_rows = get_all_rows(service, working_sheet_id, working_tab)
+            existing_urls = get_existing_foia_urls(service, foia_sheet_id)
+            pd_db = get_pd_database(service, foia_sheet_id)
+        except Exception as e:
+            st.error(f"Failed to load data: {e}")
+            working_rows = []
+            existing_urls = set()
+            pd_db = []
+
+        # Filter high-FOIA articles not yet requested
+        requestable = []
+        if working_rows and len(working_rows) > 1:
+            for i, row in enumerate(working_rows[1:], start=2):
+                while len(row) < 9:
+                    row.append("")
+                url = row[0].strip()
+                foia_score_str = row[7].strip() if len(row) > 7 else ""
+                try:
+                    foia_score = int(foia_score_str)
+                except (ValueError, TypeError):
+                    continue
+                if foia_score >= 7 and url.lower() not in existing_urls:
+                    requestable.append({
+                        "row_num": i,
+                        "url": url,
+                        "suspect_name": row[1].strip() if len(row) > 1 else "",
+                        "incident_date": row[2].strip() if len(row) > 2 else "",
+                        "police_dept": row[3].strip() if len(row) > 3 else "",
+                        "state": row[4].strip() if len(row) > 4 else "",
+                        "foia_score": foia_score,
+                    })
+
+        if not requestable:
+            st.info("No new articles with FOIA score ≥ 7 to request. Run the Analyzer first.")
+        else:
+            st.success(f"**{len(requestable)}** articles ready for FOIA requests")
+
+            # Sender name from email
+            sender_name = foia_email.split("@")[0].replace(".", " ").title() if foia_email else "Records Requester"
+
+            if "foia_drafts" not in st.session_state:
+                st.session_state.foia_drafts = {}
+
+            for idx, article in enumerate(requestable):
+                dept_name = article["police_dept"]
+                state = article["state"]
+                pd_match = lookup_department(pd_db, dept_name, state)
+
+                with st.expander(
+                    f"**{article['suspect_name']}** — {dept_name}, {state} (FOIA: {article['foia_score']})",
+                    expanded=False,
+                ):
+                    col1, col2 = st.columns([2, 1])
+                    with col2:
+                        if pd_match:
+                            method = pd_match.get("Method", "email")
+                            contact = pd_match.get("Email Address", "") if method == "email" else pd_match.get("Portal URL", "")
+                            st.caption(f"Method: **{method}** | Contact: {contact}")
+                        else:
+                            st.warning("Department not in database")
+                            method = "email"
+                            contact = ""
+                            with st.form(key=f"add_pd_{idx}"):
+                                st.caption("Add this department:")
+                                new_method = st.selectbox("Method", ["email", "portal", "both"], key=f"method_{idx}")
+                                new_email = st.text_input("Email", key=f"pd_email_{idx}")
+                                new_portal = st.text_input("Portal URL", key=f"pd_portal_{idx}")
+                                if st.form_submit_button("Save Department"):
+                                    add_department(service, foia_sheet_id, {
+                                        "name": dept_name,
+                                        "state": state,
+                                        "method": new_method,
+                                        "email": new_email,
+                                        "portal_url": new_portal,
+                                    })
+                                    st.success(f"Added {dept_name}")
+                                    st.rerun()
+
+                    with col1:
+                        # Generate draft
+                        draft_key = f"draft_{article['url']}"
+                        if draft_key not in st.session_state.foia_drafts:
+                            foia_letter = generate_foia_request(
+                                suspect_name=article["suspect_name"],
+                                incident_date=article["incident_date"],
+                                police_dept=dept_name,
+                                state=state,
+                                sender_name=sender_name,
+                            )
+                            st.session_state.foia_drafts[draft_key] = foia_letter
+
+                        letter = st.session_state.foia_drafts[draft_key]
+                        edited_body = st.text_area(
+                            "FOIA Letter",
+                            value=letter["body"],
+                            height=300,
+                            key=f"body_{idx}",
+                        )
+                        edited_subject = st.text_input(
+                            "Subject",
+                            value=letter["subject"],
+                            key=f"subject_{idx}",
+                        )
+
+                    # Action buttons
+                    btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+                    with btn_col1:
+                        if pd_match and pd_match.get("Method", "email") == "email" and pd_match.get("Email Address"):
+                            to_email = pd_match["Email Address"]
+                            if st.button(f"Send to {to_email}", key=f"send_{idx}"):
+                                if not foia_email or not foia_email_password:
+                                    st.error("Set FOIA Email and App Password in sidebar")
+                                else:
+                                    result = send_email_smtp(
+                                        smtp_host="smtp.gmail.com",
+                                        smtp_port=587,
+                                        email=foia_email,
+                                        password=foia_email_password,
+                                        to_addr=to_email,
+                                        subject=edited_subject,
+                                        body=edited_body,
+                                    )
+                                    if result["success"]:
+                                        today = datetime.now().strftime("%Y-%m-%d")
+                                        write_foia_request(service, foia_sheet_id, {
+                                            "Request ID": generate_request_id(),
+                                            "Article URL": article["url"],
+                                            "Suspect Name": article["suspect_name"],
+                                            "Incident Date": article["incident_date"],
+                                            "Police Department": dept_name,
+                                            "State": state,
+                                            "FOIA Score": str(article["foia_score"]),
+                                            "Request Method": "email",
+                                            "Contact Info": to_email,
+                                            "Status": "Sent",
+                                            "Date Created": today,
+                                            "Date Sent": today,
+                                            "Last Follow-Up": "",
+                                            "Follow-Up Count": "0",
+                                            "Notes": "",
+                                            "Request Body": edited_body,
+                                        })
+                                        st.success(f"Sent to {to_email}")
+                                    else:
+                                        st.error(f"Failed: {result['error']}")
+
+                    with btn_col2:
+                        if st.button("Save as Draft", key=f"draft_btn_{idx}"):
+                            today = datetime.now().strftime("%Y-%m-%d")
+                            write_foia_request(service, foia_sheet_id, {
+                                "Request ID": generate_request_id(),
+                                "Article URL": article["url"],
+                                "Suspect Name": article["suspect_name"],
+                                "Incident Date": article["incident_date"],
+                                "Police Department": dept_name,
+                                "State": state,
+                                "FOIA Score": str(article["foia_score"]),
+                                "Request Method": pd_match.get("Method", "unknown") if pd_match else "unknown",
+                                "Contact Info": contact,
+                                "Status": "Draft",
+                                "Date Created": today,
+                                "Date Sent": "",
+                                "Last Follow-Up": "",
+                                "Follow-Up Count": "0",
+                                "Notes": "",
+                                "Request Body": edited_body,
+                            })
+                            st.success("Saved as draft")
+
+                    with btn_col3:
+                        if pd_match and pd_match.get("Portal URL"):
+                            st.link_button("Open Portal", pd_match["Portal URL"], use_container_width=True)
+
+        # ── Section B: Request Pipeline ───────────────────────────────────
+        st.markdown("---")
+        st.markdown("##### Request Pipeline")
+
+        try:
+            all_requests = get_foia_requests(service, foia_sheet_id)
+        except Exception:
+            all_requests = []
+
+        if not all_requests:
+            st.info("No FOIA requests yet. Create one above.")
+        else:
+            # Status metrics
+            statuses = [r.get("Status", "Unknown") for r in all_requests]
+            metric_cols = st.columns(6)
+            status_labels = ["Draft", "Sent", "Acknowledged", "In Progress", "Received", "Denied"]
+            for i, label in enumerate(status_labels):
+                count = statuses.count(label)
+                metric_cols[i].metric(label, count)
+
+            # Dataframe
+            df = pd.DataFrame(all_requests)
+            display_cols = ["Request ID", "Suspect Name", "Police Department", "State", "Status", "Date Sent", "Follow-Up Count"]
+            display_cols = [c for c in display_cols if c in df.columns]
+            st.dataframe(df[display_cols], use_container_width=True)
+
+            # Status update
+            st.caption("Update request status:")
+            update_col1, update_col2, update_col3 = st.columns([2, 1, 1])
+            with update_col1:
+                req_ids = [r.get("Request ID", "") for r in all_requests]
+                selected_req = st.selectbox("Request", req_ids, key="status_update_req")
+            with update_col2:
+                new_status = st.selectbox("New Status", status_labels, key="status_update_val")
+            with update_col3:
+                if st.button("Update", key="status_update_btn"):
+                    for i, r in enumerate(all_requests):
+                        if r.get("Request ID") == selected_req:
+                            update_foia_row(service, foia_sheet_id, i + 2, {"Status": new_status})
+                            st.success(f"Updated {selected_req} → {new_status}")
+                            st.rerun()
+
+        # ── Section C: Follow-Ups Needed ──────────────────────────────────
+        st.markdown("---")
+        st.markdown("##### Follow-Ups Needed")
+
+        if all_requests:
+            needing_fu = get_requests_needing_followup(all_requests)
+            if not needing_fu:
+                st.info("All requests are up to date — no follow-ups needed.")
+            else:
+                st.warning(f"**{len(needing_fu)}** requests need follow-up")
+                for fu_idx, req in enumerate(needing_fu):
+                    days = req.get("_days_elapsed", "?")
+                    fu_count = req.get("Follow-Up Count", "0")
+                    with st.expander(
+                        f"**{req.get('Police Department', '?')}** — {days} days, {fu_count} prior follow-ups",
+                    ):
+                        st.caption(f"Suspect: {req.get('Suspect Name', '?')} | Sent: {req.get('Date Sent', '?')}")
+
+                        fu_draft_key = f"fu_draft_{req.get('Request ID', fu_idx)}"
+                        if st.button("Draft Follow-Up", key=f"fu_btn_{fu_idx}"):
+                            with st.spinner("Drafting with Claude..."):
+                                draft_text = draft_follow_up(req, anthropic_key)
+                                sender_name_fu = foia_email.split("@")[0].replace(".", " ").title() if foia_email else ""
+                                draft_text += f"\n\n{sender_name_fu}"
+                                st.session_state[fu_draft_key] = draft_text
+
+                        if fu_draft_key in st.session_state:
+                            edited_fu = st.text_area(
+                                "Follow-up draft",
+                                value=st.session_state[fu_draft_key],
+                                height=200,
+                                key=f"fu_text_{fu_idx}",
+                            )
+                            fu_send_col1, fu_send_col2 = st.columns(2)
+                            with fu_send_col1:
+                                contact_info = req.get("Contact Info", "")
+                                if contact_info and "@" in contact_info:
+                                    if st.button(f"Send to {contact_info}", key=f"fu_send_{fu_idx}"):
+                                        if not foia_email or not foia_email_password:
+                                            st.error("Set FOIA Email and App Password in sidebar")
+                                        else:
+                                            subject = f"Follow-Up: Records Request – {req.get('Suspect Name', '')} ({req.get('Incident Date', '')})"
+                                            result = send_email_smtp(
+                                                smtp_host="smtp.gmail.com",
+                                                smtp_port=587,
+                                                email=foia_email,
+                                                password=foia_email_password,
+                                                to_addr=contact_info,
+                                                subject=subject,
+                                                body=edited_fu,
+                                            )
+                                            if result["success"]:
+                                                today = datetime.now().strftime("%Y-%m-%d")
+                                                row_idx = next(
+                                                    (i for i, r in enumerate(all_requests) if r.get("Request ID") == req.get("Request ID")),
+                                                    None,
+                                                )
+                                                if row_idx is not None:
+                                                    new_count = int(fu_count or "0") + 1
+                                                    update_foia_row(service, foia_sheet_id, row_idx + 2, {
+                                                        "Last Follow-Up": today,
+                                                        "Follow-Up Count": str(new_count),
+                                                    })
+                                                st.success(f"Follow-up sent to {contact_info}")
+                                            else:
+                                                st.error(f"Failed: {result['error']}")
+        else:
+            st.info("No requests to follow up on yet.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4: TITLE GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_titles:
     if not gemini_key or not youtube_key:

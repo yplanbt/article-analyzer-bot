@@ -207,3 +207,107 @@ def append_rows_to_sheet(service, sheet_id: str, tab_name: str, rows: list[list[
         valueInputOption="RAW",
         body={"values": rows},
     ).execute()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOIA Request Tracking
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FOIA_TAB = "Requests"
+FOIA_HEADERS = [
+    "Request ID", "Article URL", "Suspect Name", "Incident Date",
+    "Police Department", "State", "FOIA Score", "Request Method",
+    "Contact Info", "Status", "Date Created", "Date Sent",
+    "Last Follow-Up", "Follow-Up Count", "Notes", "Request Body",
+]
+
+
+def ensure_foia_headers(service, sheet_id: str) -> None:
+    """Ensure the Requests tab exists with proper headers."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{FOIA_TAB}!A1:P1")
+            .execute()
+        )
+        if not result.get("values"):
+            _write_foia_headers(service, sheet_id)
+    except Exception:
+        try:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": FOIA_TAB}}}]},
+            ).execute()
+        except Exception:
+            pass
+        _write_foia_headers(service, sheet_id)
+
+
+def _write_foia_headers(service, sheet_id: str) -> None:
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{FOIA_TAB}!A1:P1",
+        valueInputOption="RAW",
+        body={"values": [FOIA_HEADERS]},
+    ).execute()
+
+
+def get_foia_requests(service, sheet_id: str) -> list[dict]:
+    """Read all FOIA requests as dicts."""
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"{FOIA_TAB}!A:P")
+        .execute()
+    )
+    rows = result.get("values", [])
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    return [
+        {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        for row in rows[1:]
+    ]
+
+
+def write_foia_request(service, sheet_id: str, request_data: dict) -> None:
+    """Append a new FOIA request to the Requests tab."""
+    row = [request_data.get(h, "") for h in FOIA_HEADERS]
+    service.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range=f"{FOIA_TAB}!A:P",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [row]},
+    ).execute()
+
+
+def update_foia_row(service, sheet_id: str, row_num: int, updates: dict) -> None:
+    """Update specific columns of a FOIA request row (row_num is 1-indexed, data row)."""
+    # Map header names to column letters
+    col_map = {h: chr(65 + i) for i, h in enumerate(FOIA_HEADERS)}
+    for field, value in updates.items():
+        if field in col_map:
+            col = col_map[field]
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=f"{FOIA_TAB}!{col}{row_num}",
+                valueInputOption="RAW",
+                body={"values": [[str(value)]]},
+            ).execute()
+
+
+def get_existing_foia_urls(service, sheet_id: str) -> set:
+    """Get all article URLs already in the FOIA tracking sheet."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{FOIA_TAB}!B:B")
+            .execute()
+        )
+        rows = result.get("values", [])
+        return {row[0].strip().lower() for row in rows[1:] if row}
+    except Exception:
+        return set()
