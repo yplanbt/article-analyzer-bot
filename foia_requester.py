@@ -46,7 +46,7 @@ Thank you for your time.
 {sender_name}"""
 
 
-def generate_foia_request(
+def generate_foia_request_simple(
     suspect_name: str,
     incident_date: str,
     police_dept: str,
@@ -57,7 +57,7 @@ def generate_foia_request(
     sender_name: str = "",
     summary: str = "",
 ) -> dict:
-    """Generate a FOIA request from article data. Returns subject + body."""
+    """Generate a basic FOIA request from article data. Returns subject + body."""
     description = summary if summary else f"Arrest of {suspect_name}"
     if not location:
         location = f"{police_dept} jurisdiction, {state}"
@@ -74,6 +74,97 @@ def generate_foia_request(
         sender_name=sender_name,
     )
     return {"subject": subject, "body": body}
+
+
+def generate_foia_request_ai(
+    article_text: str,
+    suspect_name: str,
+    incident_date: str,
+    police_dept: str,
+    state: str,
+    sender_name: str,
+    anthropic_key: str,
+) -> dict:
+    """Use Claude to generate a detailed, case-specific FOIA request letter."""
+    client = anthropic.Anthropic(api_key=anthropic_key)
+
+    prompt = f"""You are writing a FOIA / public records request for body-worn camera footage.
+
+ARTICLE ABOUT THE INCIDENT:
+{article_text[:6000]}
+
+KNOWN DETAILS:
+- Suspect: {suspect_name}
+- Date: {incident_date}
+- Police Department: {police_dept}
+- State: {state}
+
+Write a professional FOIA request letter using this EXACT format. Fill in every field with specific details from the article:
+
+---
+Dear Records Custodian,
+
+I am requesting copies of body-worn camera footage related to the following incident:
+
+Date: [exact date from article]
+Location: [specific address/location from article, or best available]
+Incident Description: [2-3 sentences describing exactly what happened — charges, circumstances, key details from the article]
+Involved Officer(s) (if known): [names from article, or "Not identified in public reporting"]
+Time frame requested: [estimate based on incident type, e.g. "Approximately 30 minutes covering the arrest and booking" or "Full duration of the traffic stop and subsequent arrest"]
+
+Please include any body-worn camera recordings from the officers who responded during this timeframe, as well as the incident report associated with this event.
+
+Electronic delivery is preferred. Please let me know if estimated fees exceed $200 before processing.
+
+Thank you for your time.
+
+{sender_name}
+---
+
+Rules:
+- Use ONLY facts from the article. Do not invent details.
+- Be specific about the incident — vague requests get denied.
+- If the article mentions multiple officers or a specific unit, reference them.
+- Output ONLY the letter text, nothing else."""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    body = response.content[0].text.strip()
+
+    subject = f"Records Request – Body-Worn Camera Footage ({incident_date})"
+    return {"subject": subject, "body": body}
+
+
+def search_pd_contact(police_dept: str, state: str, anthropic_key: str) -> dict:
+    """Use Claude to suggest how to contact a police department for records requests."""
+    client = anthropic.Anthropic(api_key=anthropic_key)
+
+    prompt = f"""I need to find the records request contact for: {police_dept}, {state}
+
+Based on your knowledge, provide:
+1. The most likely email address for records/FOIA requests (many PDs use formats like records@cityPD.gov, foiarequests@city.gov, or publicrecords@city.us)
+2. Whether they likely use an online portal (GovQA, NextRequest, JustFOIA, or their own)
+3. The portal URL if known
+
+Return ONLY valid JSON:
+{{"method": "email" or "portal" or "both", "email": "best guess email or empty string", "portal_url": "URL or empty string", "portal_type": "govqa/nextrequest/justfoia/other/none", "notes": "any helpful info about this department's FOIA process"}}
+
+If you're not confident about the email, still provide your best guess based on common patterns for that city/county. Note that in the JSON."""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    import json, re
+    raw = response.content[0].text.strip()
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if match:
+        return json.loads(match.group())
+    return {"method": "email", "email": "", "portal_url": "", "notes": "Could not determine contact info"}
 
 
 def generate_request_id() -> str:

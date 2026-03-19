@@ -15,8 +15,8 @@ from sheets_client import (
     write_foia_request, update_foia_row, get_existing_foia_urls,
 )
 from foia_requester import (
-    generate_foia_request, generate_request_id, send_email_smtp,
-    draft_follow_up, get_requests_needing_followup,
+    generate_foia_request_ai, generate_request_id, send_email_smtp,
+    draft_follow_up, get_requests_needing_followup, search_pd_contact,
 )
 from pd_database import (
     get_pd_database, lookup_department, add_department,
@@ -1004,137 +1004,200 @@ with tab_foia:
 
             if "foia_drafts" not in st.session_state:
                 st.session_state.foia_drafts = {}
+            if "pd_suggestions" not in st.session_state:
+                st.session_state.pd_suggestions = {}
 
             for idx, article in enumerate(requestable):
                 dept_name = article["police_dept"]
-                state = article["state"]
-                pd_match = lookup_department(pd_db, dept_name, state)
+                art_state = article["state"]
+                pd_match = lookup_department(pd_db, dept_name, art_state)
 
                 with st.expander(
-                    f"**{article['suspect_name']}** — {dept_name}, {state} (FOIA: {article['foia_score']})",
+                    f"**{article['suspect_name']}** — {dept_name}, {art_state} (FOIA: {article['foia_score']})",
                     expanded=False,
                 ):
-                    col1, col2 = st.columns([2, 1])
-                    with col2:
-                        if pd_match:
-                            method = pd_match.get("Method", "email")
-                            contact = pd_match.get("Email Address", "") if method == "email" else pd_match.get("Portal URL", "")
-                            st.caption(f"Method: **{method}** | Contact: {contact}")
+                    # ── Department contact info ──
+                    st.markdown("**Department Contact**")
+                    if pd_match:
+                        method = pd_match.get("Method", "email")
+                        email_addr = pd_match.get("Email Address", "")
+                        portal_url = pd_match.get("Portal URL", "")
+                        contact = email_addr if method in ("email", "both") else portal_url
+                        st.info(f"**{dept_name}** — Method: **{method}** | Email: {email_addr} | Portal: {portal_url}")
+                        if pd_match.get("Notes"):
+                            st.caption(f"Notes: {pd_match['Notes']}")
+                    else:
+                        st.warning(f"**{dept_name}** not in database yet.")
+                        contact = ""
+
+                        # AI-powered PD contact search
+                        pd_sug_key = f"pd_sug_{dept_name}_{art_state}"
+                        if st.button(f"Search for {dept_name} contact info", key=f"search_pd_{idx}"):
+                            with st.spinner("Searching with AI..."):
+                                suggestion = search_pd_contact(dept_name, art_state, anthropic_key)
+                                st.session_state.pd_suggestions[pd_sug_key] = suggestion
+
+                        if pd_sug_key in st.session_state.pd_suggestions:
+                            sug = st.session_state.pd_suggestions[pd_sug_key]
+                            st.caption(f"AI suggestion: {sug.get('method', '?')} — Email: {sug.get('email', 'N/A')} — Portal: {sug.get('portal_url', 'N/A')}")
+                            if sug.get("notes"):
+                                st.caption(f"Notes: {sug['notes']}")
+
+                        with st.form(key=f"add_pd_{idx}"):
+                            st.caption("Add this department to your database:")
+                            sug = st.session_state.pd_suggestions.get(pd_sug_key, {})
+                            add_col1, add_col2 = st.columns(2)
+                            with add_col1:
+                                new_method = st.selectbox("Method", ["email", "portal", "both"],
+                                    index=["email", "portal", "both"].index(sug.get("method", "email")) if sug.get("method") in ["email", "portal", "both"] else 0,
+                                    key=f"method_{idx}")
+                                new_email = st.text_input("Records Email", value=sug.get("email", ""), key=f"pd_email_{idx}")
+                            with add_col2:
+                                new_portal = st.text_input("Portal URL", value=sug.get("portal_url", ""), key=f"pd_portal_{idx}")
+                                new_notes = st.text_input("Notes", value=sug.get("notes", ""), key=f"pd_notes_{idx}")
+                            if st.form_submit_button("Save Department"):
+                                add_department(service, foia_sheet_id, {
+                                    "name": dept_name,
+                                    "state": art_state,
+                                    "method": new_method,
+                                    "email": new_email,
+                                    "portal_url": new_portal,
+                                    "notes": new_notes,
+                                })
+                                st.success(f"Added {dept_name} to database")
+                                st.rerun()
+
+                    # ── FOIA Letter ──
+                    st.markdown("---")
+                    st.markdown("**FOIA Request Letter**")
+
+                    draft_key = f"draft_{article['url']}"
+
+                    # Generate AI-powered letter on demand
+                    if draft_key not in st.session_state.foia_drafts:
+                        if st.button(f"Generate FOIA Letter", key=f"gen_{idx}", type="primary"):
+                            with st.spinner("Scraping article and generating letter with AI..."):
+                                try:
+                                    scraped = scrape_article(article["url"])
+                                    article_text = scraped.get("text", "") if scraped else ""
+                                except Exception:
+                                    article_text = ""
+
+                                if article_text:
+                                    foia_letter = generate_foia_request_ai(
+                                        article_text=article_text,
+                                        suspect_name=article["suspect_name"],
+                                        incident_date=article["incident_date"],
+                                        police_dept=dept_name,
+                                        state=art_state,
+                                        sender_name=sender_name,
+                                        anthropic_key=anthropic_key,
+                                    )
+                                else:
+                                    # Fallback: basic template if article can't be scraped
+                                    from foia_requester import generate_foia_request_simple
+                                    foia_letter = generate_foia_request_simple(
+                                        suspect_name=article["suspect_name"],
+                                        incident_date=article["incident_date"],
+                                        police_dept=dept_name,
+                                        state=art_state,
+                                        sender_name=sender_name,
+                                    )
+                                    st.warning("Could not scrape article — using basic template. Edit the letter to add details.")
+
+                                st.session_state.foia_drafts[draft_key] = foia_letter
+                                st.rerun()
                         else:
-                            st.warning("Department not in database")
-                            method = "email"
-                            contact = ""
-                            with st.form(key=f"add_pd_{idx}"):
-                                st.caption("Add this department:")
-                                new_method = st.selectbox("Method", ["email", "portal", "both"], key=f"method_{idx}")
-                                new_email = st.text_input("Email", key=f"pd_email_{idx}")
-                                new_portal = st.text_input("Portal URL", key=f"pd_portal_{idx}")
-                                if st.form_submit_button("Save Department"):
-                                    add_department(service, foia_sheet_id, {
-                                        "name": dept_name,
-                                        "state": state,
-                                        "method": new_method,
-                                        "email": new_email,
-                                        "portal_url": new_portal,
-                                    })
-                                    st.success(f"Added {dept_name}")
-                                    st.rerun()
-
-                    with col1:
-                        # Generate draft
-                        draft_key = f"draft_{article['url']}"
-                        if draft_key not in st.session_state.foia_drafts:
-                            foia_letter = generate_foia_request(
-                                suspect_name=article["suspect_name"],
-                                incident_date=article["incident_date"],
-                                police_dept=dept_name,
-                                state=state,
-                                sender_name=sender_name,
-                            )
-                            st.session_state.foia_drafts[draft_key] = foia_letter
-
+                            st.caption(f"Article: {article['url']}")
+                    else:
                         letter = st.session_state.foia_drafts[draft_key]
-                        edited_body = st.text_area(
-                            "FOIA Letter",
-                            value=letter["body"],
-                            height=300,
-                            key=f"body_{idx}",
-                        )
                         edited_subject = st.text_input(
                             "Subject",
                             value=letter["subject"],
                             key=f"subject_{idx}",
                         )
+                        edited_body = st.text_area(
+                            "Letter body (edit as needed)",
+                            value=letter["body"],
+                            height=350,
+                            key=f"body_{idx}",
+                        )
 
-                    # Action buttons
-                    btn_col1, btn_col2, btn_col3 = st.columns(3)
+                        if st.button("Regenerate", key=f"regen_{idx}"):
+                            del st.session_state.foia_drafts[draft_key]
+                            st.rerun()
 
-                    with btn_col1:
-                        if pd_match and pd_match.get("Method", "email") == "email" and pd_match.get("Email Address"):
-                            to_email = pd_match["Email Address"]
-                            if st.button(f"Send to {to_email}", key=f"send_{idx}"):
-                                if not foia_email or not foia_email_password:
-                                    st.error("Set FOIA Email and App Password in sidebar")
-                                else:
-                                    result = send_email_smtp(
-                                        smtp_host="smtp.gmail.com",
-                                        smtp_port=587,
-                                        email=foia_email,
-                                        password=foia_email_password,
-                                        to_addr=to_email,
-                                        subject=edited_subject,
-                                        body=edited_body,
-                                    )
-                                    if result["success"]:
-                                        today = datetime.now().strftime("%Y-%m-%d")
-                                        write_foia_request(service, foia_sheet_id, {
-                                            "Request ID": generate_request_id(),
-                                            "Article URL": article["url"],
-                                            "Suspect Name": article["suspect_name"],
-                                            "Incident Date": article["incident_date"],
-                                            "Police Department": dept_name,
-                                            "State": state,
-                                            "FOIA Score": str(article["foia_score"]),
-                                            "Request Method": "email",
-                                            "Contact Info": to_email,
-                                            "Status": "Sent",
-                                            "Date Created": today,
-                                            "Date Sent": today,
-                                            "Last Follow-Up": "",
-                                            "Follow-Up Count": "0",
-                                            "Notes": "",
-                                            "Request Body": edited_body,
-                                        })
-                                        st.success(f"Sent to {to_email}")
+                        # Action buttons
+                        btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+                        with btn_col1:
+                            to_email = None
+                            if pd_match and pd_match.get("Email Address"):
+                                to_email = pd_match["Email Address"]
+                            if to_email:
+                                if st.button(f"Send to {to_email}", key=f"send_{idx}", type="primary"):
+                                    if not foia_email or not foia_email_password:
+                                        st.error("Set FOIA Email and App Password in sidebar")
                                     else:
-                                        st.error(f"Failed: {result['error']}")
+                                        result = send_email_smtp(
+                                            smtp_host="smtp.gmail.com",
+                                            smtp_port=587,
+                                            email=foia_email,
+                                            password=foia_email_password,
+                                            to_addr=to_email,
+                                            subject=edited_subject,
+                                            body=edited_body,
+                                        )
+                                        if result["success"]:
+                                            today = datetime.now().strftime("%Y-%m-%d")
+                                            write_foia_request(service, foia_sheet_id, {
+                                                "Request ID": generate_request_id(),
+                                                "Article URL": article["url"],
+                                                "Suspect Name": article["suspect_name"],
+                                                "Incident Date": article["incident_date"],
+                                                "Police Department": dept_name,
+                                                "State": art_state,
+                                                "FOIA Score": str(article["foia_score"]),
+                                                "Request Method": "email",
+                                                "Contact Info": to_email,
+                                                "Status": "Sent",
+                                                "Date Created": today,
+                                                "Date Sent": today,
+                                                "Last Follow-Up": "",
+                                                "Follow-Up Count": "0",
+                                                "Notes": "",
+                                                "Request Body": edited_body,
+                                            })
+                                            st.success(f"Sent to {to_email}")
+                                        else:
+                                            st.error(f"Failed: {result['error']}")
 
-                    with btn_col2:
-                        if st.button("Save as Draft", key=f"draft_btn_{idx}"):
-                            today = datetime.now().strftime("%Y-%m-%d")
-                            write_foia_request(service, foia_sheet_id, {
-                                "Request ID": generate_request_id(),
-                                "Article URL": article["url"],
-                                "Suspect Name": article["suspect_name"],
-                                "Incident Date": article["incident_date"],
-                                "Police Department": dept_name,
-                                "State": state,
-                                "FOIA Score": str(article["foia_score"]),
-                                "Request Method": pd_match.get("Method", "unknown") if pd_match else "unknown",
-                                "Contact Info": contact,
-                                "Status": "Draft",
-                                "Date Created": today,
-                                "Date Sent": "",
-                                "Last Follow-Up": "",
-                                "Follow-Up Count": "0",
-                                "Notes": "",
-                                "Request Body": edited_body,
-                            })
-                            st.success("Saved as draft")
+                        with btn_col2:
+                            if st.button("Save as Draft", key=f"draft_btn_{idx}"):
+                                today = datetime.now().strftime("%Y-%m-%d")
+                                write_foia_request(service, foia_sheet_id, {
+                                    "Request ID": generate_request_id(),
+                                    "Article URL": article["url"],
+                                    "Suspect Name": article["suspect_name"],
+                                    "Incident Date": article["incident_date"],
+                                    "Police Department": dept_name,
+                                    "State": art_state,
+                                    "FOIA Score": str(article["foia_score"]),
+                                    "Request Method": pd_match.get("Method", "unknown") if pd_match else "unknown",
+                                    "Contact Info": contact,
+                                    "Status": "Draft",
+                                    "Date Created": today,
+                                    "Date Sent": "",
+                                    "Last Follow-Up": "",
+                                    "Follow-Up Count": "0",
+                                    "Notes": "",
+                                    "Request Body": edited_body,
+                                })
+                                st.success("Saved as draft")
 
-                    with btn_col3:
-                        if pd_match and pd_match.get("Portal URL"):
-                            st.link_button("Open Portal", pd_match["Portal URL"], use_container_width=True)
+                        with btn_col3:
+                            if pd_match and pd_match.get("Portal URL"):
+                                st.link_button("Open Portal", pd_match["Portal URL"], use_container_width=True)
 
         # ── Section B: Request Pipeline ───────────────────────────────────
         st.markdown("---")
