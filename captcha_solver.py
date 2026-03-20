@@ -1,6 +1,6 @@
 """CAPTCHA solving via 2captcha API.
 
-Supports reCAPTCHA v2, hCaptcha, and image CAPTCHAs.
+Supports reCAPTCHA v2, reCAPTCHA v3, hCaptcha, and image CAPTCHAs.
 Cost: ~$2-3 per 1000 solves (~$0.003 each).
 
 Setup:
@@ -53,6 +53,46 @@ def solve_recaptcha_v2(api_key: str, site_key: str, page_url: str) -> dict:
 
     except Exception as e:
         logger.error("reCAPTCHA solve failed: %s", e)
+        return {"success": False, "solution": "", "error": str(e)}
+
+
+def solve_recaptcha_v3(api_key: str, site_key: str, page_url: str, action: str = "verify", min_score: float = 0.7) -> dict:
+    """Solve an invisible reCAPTCHA v3 challenge.
+
+    Args:
+        api_key: 2captcha API key
+        site_key: The reCAPTCHA v3 site key (from render= parameter or data-sitekey)
+        page_url: The URL of the page with the CAPTCHA
+        action: The action parameter used by the site (default: "verify")
+        min_score: Minimum score to request (0.1-0.9, default: 0.7)
+
+    Returns:
+        {"success": bool, "solution": str, "error": str}
+    """
+    logger.info("Solving reCAPTCHA v3 for %s (action=%s, min_score=%.1f)", page_url, action, min_score)
+    try:
+        resp = requests.post(f"{BASE_URL}/in.php", data={
+            "key": api_key,
+            "method": "userrecaptcha",
+            "googlekey": site_key,
+            "pageurl": page_url,
+            "version": "v3",
+            "action": action,
+            "min_score": min_score,
+            "json": 1,
+        }, timeout=30)
+        data = resp.json()
+
+        if data.get("status") != 1:
+            return {"success": False, "solution": "", "error": data.get("request", "Submit failed")}
+
+        task_id = data["request"]
+        logger.info("reCAPTCHA v3 task submitted: %s", task_id)
+
+        return _poll_result(api_key, task_id)
+
+    except Exception as e:
+        logger.error("reCAPTCHA v3 solve failed: %s", e)
         return {"success": False, "solution": "", "error": str(e)}
 
 

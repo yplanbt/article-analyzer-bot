@@ -34,6 +34,7 @@ def submit_to_portal(
     portal_credentials: dict = None,
     headless: bool = True,
     anthropic_key: str = "",
+    proxy: str = "",
 ) -> dict:
     """Submit a FOIA request through a portal. Returns status dict.
 
@@ -52,7 +53,16 @@ def submit_to_portal(
         portal_credentials: {"email": ..., "password": ...} for portal login
         headless: Run browser without visible window
         anthropic_key: Anthropic API key for AI agent fallback
+        proxy: US proxy URL. Falls back to US_PROXY env var.
     """
+    import os
+    proxy_url = proxy or os.environ.get("US_PROXY", "")
+
+    # Configurable headed mode
+    headless_env = os.environ.get("BROWSER_HEADLESS", "").lower()
+    if headless_env in ("false", "0", "no"):
+        headless = False
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -74,10 +84,23 @@ def submit_to_portal(
     # For known portals, try Playwright first
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
+            launch_args = {"headless": headless}
+            if proxy_url:
+                launch_args["proxy"] = {"server": proxy_url}
+            browser = p.chromium.launch(**launch_args)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-US",
+                timezone_id="America/New_York",
             )
+
+            # Inject stealth script to avoid bot detection
+            try:
+                from ai_browser_agent import _get_stealth_script
+                context.add_init_script(_get_stealth_script())
+            except ImportError:
+                pass
+
             page = context.new_page()
             page.set_default_timeout(30000)
 
