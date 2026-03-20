@@ -1,0 +1,13 @@
+{
+  "name": "foia-portal",
+  "description": "Submit FOIA bodycam footage requests through police department portals (GovQA, NextRequest, JustFOIA, etc). Reads pending requests from Google Sheet, submits via browser, updates status.",
+  "version": "1.1.0",
+  "trigger": ["manual"],
+  "tools": ["browser", "shell"],
+  "config": {
+    "sheet_id": "1ZoEAj_w-IxpY45GDKK3gNSqgAf0dHK75ihjT3IbPbf8",
+    "requester_email": "sjaden1993@gmail.com",
+    "requester_name": "S Jaden",
+    "sa_key_path": "~/.openclaw/workspace/google-sa-key.json"
+  }
+}

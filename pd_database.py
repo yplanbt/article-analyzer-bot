@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 PD_DB_TAB = "PD Database"
 PD_DB_HEADERS = [
     "Department Name", "State", "Method", "Email Address",
-    "Portal URL", "Portal Type", "Notes", "Last Used",
+    "Portal URL", "Portal Type", "Notes", "Last Used", "Has CAPTCHA",
 ]
 
 
@@ -28,7 +28,7 @@ def get_pd_database(service, sheet_id: str) -> list[dict]:
         result = (
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=sheet_id, range=f"{PD_DB_TAB}!A:H")
+            .get(spreadsheetId=sheet_id, range=f"{PD_DB_TAB}!A:I")
             .execute()
         )
         rows = result.get("values", [])
@@ -80,10 +80,11 @@ def add_department(service, sheet_id: str, dept_info: dict) -> None:
         dept_info.get("portal_type", ""),
         dept_info.get("notes", ""),
         "",  # Last Used
+        dept_info.get("has_captcha", ""),
     ]
     service.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"{PD_DB_TAB}!A:H",
+        range=f"{PD_DB_TAB}!A:I",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [row]},
@@ -100,13 +101,29 @@ def update_department_last_used(service, sheet_id: str, row_num: int, date_str: 
     ).execute()
 
 
+def mark_department_captcha(service, sheet_id: str, dept_name: str, state: str) -> None:
+    """Mark a department as having CAPTCHA on its portal."""
+    pd_db = get_pd_database(service, sheet_id)
+    for i, entry in enumerate(pd_db):
+        if (entry.get("Department Name", "").lower().strip() == dept_name.lower().strip()
+                and entry.get("State", "").lower().strip() == state.lower().strip()):
+            row_num = i + 2  # 1-indexed + header
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=f"{PD_DB_TAB}!I{row_num}",
+                valueInputOption="RAW",
+                body={"values": [["TRUE"]]},
+            ).execute()
+            return
+
+
 def ensure_pd_db_headers(service, sheet_id: str) -> None:
     """Create PD Database tab with headers if it doesn't exist."""
     try:
         result = (
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=sheet_id, range=f"{PD_DB_TAB}!A1:H1")
+            .get(spreadsheetId=sheet_id, range=f"{PD_DB_TAB}!A1:I1")
             .execute()
         )
         if not result.get("values"):
@@ -126,7 +143,7 @@ def ensure_pd_db_headers(service, sheet_id: str) -> None:
 def _write_headers(service, sheet_id: str) -> None:
     service.spreadsheets().values().update(
         spreadsheetId=sheet_id,
-        range=f"{PD_DB_TAB}!A1:H1",
+        range=f"{PD_DB_TAB}!A1:I1",
         valueInputOption="RAW",
         body={"values": [PD_DB_HEADERS]},
     ).execute()

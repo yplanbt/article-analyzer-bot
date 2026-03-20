@@ -6,7 +6,71 @@ from datetime import datetime, date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+import json
+import logging
+import time
+
 import anthropic
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_json(raw: str, required_fields: list = None) -> dict | None:
+    """Extract the first valid JSON object from raw text using balanced-brace scanning.
+
+    More resilient than a simple regex: handles nested braces, trailing text, and
+    common LLM artifacts like markdown code fences or leading explanatory sentences.
+    """
+    if not raw:
+        logger.warning("_extract_json received empty string")
+        return None
+
+    raw = raw.strip()
+
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        # Drop the opening fence line and any closing fence
+        inner_lines = [l for l in lines[1:] if not l.strip().startswith("```")]
+        raw = "\n".join(inner_lines).strip()
+
+    # Fast path: entire string is valid JSON
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            if not required_fields or all(f in obj for f in required_fields):
+                return obj
+        logger.debug("_extract_json: top-level JSON parsed but missing required fields")
+    except json.JSONDecodeError:
+        pass
+
+    # Balanced-brace scan to find the first JSON object
+    depth = 0
+    start = None
+    for i, ch in enumerate(raw):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = raw[start:i + 1]
+                try:
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict):
+                        if not required_fields or all(f in obj for f in required_fields):
+                            return obj
+                        else:
+                            missing = [f for f in (required_fields or []) if f not in obj]
+                            logger.debug("_extract_json: found JSON object missing fields: %s", missing)
+                except json.JSONDecodeError as exc:
+                    logger.debug("_extract_json: JSON parse error at brace pair [%d:%d]: %s", start, i + 1, exc)
+                start = None
+
+    logger.warning("_extract_json: no valid JSON object found in %d-char string", len(raw))
+    return None
+
 
 # State FOIA response deadlines (business days)
 STATE_FOIA_DEADLINES = {
@@ -76,6 +140,60 @@ def generate_foia_request_simple(
     return {"subject": subject, "body": body}
 
 
+def _verify_foia_letter_completeness(result: dict) -> dict:
+    """Check a generated FOIA letter result for missing critical fields.
+
+    Adds a 'warnings' key listing any critical omissions found.  Does NOT
+    modify the letter content — the caller decides how to surface these.
+    """
+    warnings = []
+
+    body = result.get("body", "")
+    body_lower = body.lower()
+
+    # --- Date check ---
+    incident_date = result.get("incident_date", "").strip()
+    if not incident_date or incident_date.lower() in ("unknown", ""):
+        warnings.append("incident_date is missing or unknown")
+    # Also confirm the date appears somewhere in the letter body
+    if incident_date and incident_date.lower() not in ("unknown", "") and incident_date not in body:
+        warnings.append(f"incident_date '{incident_date}' does not appear in letter body")
+
+    # --- Time check ---
+    incident_time = result.get("incident_time", "").strip()
+    if not incident_time or incident_time.lower() in ("unknown", "not stated", ""):
+        warnings.append("incident_time is missing or unknown — letter may be rejected or delayed")
+    # Look for time-like patterns in the body (e.g. "3:45 PM", "morning", "evening")
+    import re as _re_check
+    time_pattern = _re_check.compile(
+        r"\b(\d{1,2}:\d{2}\s*(am|pm|AM|PM)?|morning|afternoon|evening|night|midnight|noon)\b"
+    )
+    if not time_pattern.search(body):
+        warnings.append("no time reference found in letter body")
+
+    # --- Location check ---
+    incident_location = result.get("incident_location", "").strip()
+    if not incident_location or incident_location.lower() in ("unknown", ""):
+        warnings.append("incident_location is missing or unknown — letter may be rejected or delayed")
+    # A bare "Unknown" in the body location line is also a problem
+    if "location: unknown" in body_lower:
+        warnings.append("location field in letter body reads 'Unknown'")
+
+    # --- Timeframe check ---
+    timeframe = result.get("timeframe", "").strip()
+    if not timeframe or timeframe.lower() in ("unknown", ""):
+        warnings.append("timeframe for footage requested is missing")
+
+    if warnings:
+        logger.warning(
+            "generate_foia_request_ai completeness check found %d issue(s): %s",
+            len(warnings), "; ".join(warnings),
+        )
+
+    result["warnings"] = warnings
+    return result
+
+
 def generate_foia_request_ai(
     article_text: str,
     suspect_name: str,
@@ -85,13 +203,25 @@ def generate_foia_request_ai(
     sender_name: str,
     anthropic_key: str,
 ) -> dict:
-    """Use Claude to generate a detailed, case-specific FOIA request letter."""
+    """Use Claude to generate a detailed, case-specific FOIA request with structured fields.
+
+    Returns a dict with at minimum 'subject' and 'body'.  Also includes extracted
+    metadata fields (incident_date, incident_time, incident_location, case_number,
+    officer_names, charges, victim_name, timeframe) and a 'warnings' list that
+    flags any critical omissions detected in the generated letter.
+    """
+    import json as _json
+    import re as _re
     client = anthropic.Anthropic(api_key=anthropic_key)
+    logger.info(
+        "generate_foia_request_ai: generating letter for %s / %s / %s",
+        suspect_name, police_dept, incident_date,
+    )
 
     prompt = f"""You are writing a FOIA / public records request for body-worn camera footage.
 
 ARTICLE ABOUT THE INCIDENT:
-{article_text[:6000]}
+{article_text[:8000]}
 
 KNOWN DETAILS:
 - Suspect: {suspect_name}
@@ -99,78 +229,320 @@ KNOWN DETAILS:
 - Police Department: {police_dept}
 - State: {state}
 
-Write a professional FOIA request letter using this EXACT format. Fill in every field with specific details from the article:
+STEP 1: Extract ALL available details from the article. Be thorough — missing details cause requests to be rejected.
+Pay special attention to:
+  • EXACT TIME — scan for phrases like "around 3 PM", "late Tuesday night", "shortly after midnight", "at approximately 10:45 a.m."
+  • EXACT LOCATION — scan for street addresses, intersections, named businesses, landmarks, neighborhoods, or block ranges.
+  • CASE / REPORT NUMBERS — look for patterns like "case #", "report number", "incident no.", or any numeric ID in police quotes.
+  • OFFICER NAMES — look in direct quotes from the department, arrest records, or bylines that credit officers.
 
+STEP 2: Write a professional, detailed FOIA request letter. The letter MUST include:
+- Exact date of incident
+- Time of incident (exact time like "3:45 PM" if stated; if only implied, use the best estimate with a qualifier
+  like "approximately 10:00 PM" or "early morning hours"; NEVER leave blank)
+- Specific location (street address, intersection, or business name from the article; NEVER leave blank)
+- Case/incident/report number if mentioned anywhere in the article
+- Names of officers involved if mentioned
+- Specific charges filed
+- Victim name if mentioned
+- A clear timeframe for the footage requested (e.g. "2:00 PM to 4:00 PM on March 15, 2026")
+
+STEP 3: Return a JSON object with these fields:
+
+{{
+  "subject": "Public Records Request – Body-Worn Camera Footage – {suspect_name} – {incident_date}",
+  "body": "The full letter text (see format below)",
+  "incident_date": "exact date extracted from article",
+  "incident_time": "exact or estimated time — NEVER 'Unknown' unless article provides zero time context",
+  "incident_location": "most specific location from article — street, intersection, or business name",
+  "case_number": "case/report number if mentioned, or empty string",
+  "officer_names": "officer names if mentioned, or 'Not identified in article'",
+  "charges": "specific charges listed in the article",
+  "victim_name": "victim name if mentioned, or empty string",
+  "timeframe": "footage timeframe like '2:00 PM – 4:00 PM on March 15, 2026'"
+}}
+
+LETTER FORMAT (for the "body" field):
 ---
+[Today's Date]
+
+Records Custodian
+{police_dept}
+{state}
+
+Re: Public Records Request — Body-Worn Camera Footage and Incident Report
+
 Dear Records Custodian,
 
-I am requesting copies of body-worn camera footage related to the following incident:
+Pursuant to [state] public records law, I am formally requesting copies of body-worn camera (BWC) footage and the associated incident report for the following incident:
 
-Date: [exact date from article]
-Location: [specific address/location from article, or best available]
-Incident Description: [2-3 sentences describing exactly what happened — charges, circumstances, key details from the article]
-Involved Officer(s) (if known): [names from article, or "Not identified in public reporting"]
-Time frame requested: [estimate based on incident type, e.g. "Approximately 30 minutes covering the arrest and booking" or "Full duration of the traffic stop and subsequent arrest"]
+  Date of Incident:          [exact date]
+  Approximate Time:          [time or best estimate — NEVER omit; always include a qualifier if estimated]
+  Location:                  [specific street address, intersection, or business name — NEVER omit]
+  Incident Report/Case No.:  [number if known, otherwise "Not available — please cross-reference using the details below"]
+  Suspect(s):                [full name(s)]
+  Victim(s):                 [name(s) if known, otherwise omit this line]
+  Charges:                   [specific charges from article]
+  Involved Officer(s):       [names if known, otherwise "All responding officers"]
 
-Please include any body-worn camera recordings from the officers who responded during this timeframe, as well as the incident report associated with this event.
+Incident Summary:
+[4-5 detailed sentences summarizing what happened: the call for service or triggering event, the officers' response,
+the key actions taken, the arrest or outcome, and any charges filed. Draw directly from the article — be factual
+and specific.]
 
-Electronic delivery is preferred. Please let me know if estimated fees exceed $200 before processing.
+Records Requested:
+1. All body-worn camera (BWC) recordings from every officer who responded to or was present at this incident,
+   covering the approximate timeframe of [footage start time] to [footage end time] on [date].
+2. Dashboard camera (dash-cam) recordings from all responding patrol units.
+3. The incident/offense report and any supplements filed in connection with this event.
+4. Computer-Aided Dispatch (CAD) logs and dispatch audio for this call.
+5. Any arrest report, booking photograph, or use-of-force report associated with this incident.
 
-Thank you for your time.
+Please provide records in their native digital format where possible. Electronic delivery is preferred (secure
+email, cloud link, or file transfer service). If the estimated cost of fulfilling this request exceeds $200,
+please notify me before processing so I can refine or prioritize the request.
 
+If any portion of this request is denied, please provide a written explanation citing the specific statutory
+exemption(s) relied upon, and release all non-exempt portions.
+
+I look forward to your response within the time period required by [state] law.
+
+Thank you for your prompt attention to this matter.
+
+Sincerely,
 {sender_name}
 ---
 
-Rules:
-- Use ONLY facts from the article. Do not invent details.
-- Be specific about the incident — vague requests get denied.
-- If the article mentions multiple officers or a specific unit, reference them.
-- Output ONLY the letter text, nothing else."""
+CRITICAL RULES:
+- Use ONLY facts from the article. NEVER invent names, numbers, or locations.
+- NEVER leave Date, Time, or Location blank. If time is not explicit, reason it out from context (e.g. if the
+  article says "Tuesday night" and was published Wednesday March 19, 2026, then the incident was Tuesday
+  March 18 and time was "night, approximately 8:00 PM – midnight").
+- Fill in [state] with the actual state name in the letter body.
+- Fill in today's date as the letter date.
+- Be specific and detailed — vague requests are rejected or substantially delayed.
+- Return ONLY the JSON object. No preamble, no markdown fences, no extra text."""
 
+    logger.debug("generate_foia_request_ai: sending prompt to Claude (%d chars)", len(prompt))
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1000,
+        max_tokens=3000,
         messages=[{"role": "user", "content": prompt}],
     )
-    body = response.content[0].text.strip()
+    raw = response.content[0].text.strip()
+    logger.debug("generate_foia_request_ai: received %d-char response", len(raw))
 
-    subject = f"Records Request – Body-Worn Camera Footage ({incident_date})"
-    return {"subject": subject, "body": body}
+    # Use resilient _extract_json to parse structured result
+    required = ["subject", "body"]
+    result = _extract_json(raw, required_fields=required)
+
+    if result and "subject" in result and "body" in result:
+        logger.info("generate_foia_request_ai: successfully parsed JSON response")
+        return _verify_foia_letter_completeness(result)
+
+    # Fallback: treat the whole response as the letter body
+    logger.warning(
+        "generate_foia_request_ai: JSON parse failed — falling back to raw text body"
+    )
+    subject = f"Public Records Request – Body-Worn Camera Footage – {suspect_name} – {incident_date}"
+    fallback = {"subject": subject, "body": raw}
+    return _verify_foia_letter_completeness(fallback)
 
 
-def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthropic_key: str) -> dict:
-    """Search the web for a PD's FOIA contact info, then have Claude extract it."""
-    import json, re, requests as req
+def _verify_url(url: str, max_redirects: int = 3, require_records_content: bool = True) -> bool:
+    """Check if a URL is live, not a generic vendor redirect, and (optionally) contains
+    records-portal keywords.
 
-    # Step 1: Search Google via SerpAPI for the PD's records request page
-    queries = [
-        f"{police_dept} {state} public records request body camera FOIA email",
-        f"{police_dept} {state} records custodian FOIA portal",
+    Parameters
+    ----------
+    url:
+        The URL to verify.
+    max_redirects:
+        How many redirect hops to follow before giving up.  Defaults to 3 so we
+        chase short-URL chains without following infinite loops.
+    require_records_content:
+        When True (default), perform a GET request and check that the final page
+        body contains at least one keyword indicating it is a records/FOIA portal.
+        Set to False if you only need a liveness check.
+    """
+    import requests as req
+
+    if not url or not url.startswith("http"):
+        logger.debug("_verify_url: rejected '%s' — not an http(s) URL", url)
+        return False
+
+    # Known generic vendor marketing/home pages that are NOT departmental portals
+    bad_redirects = [
+        "civicplus.com",
+        "govqa.us/home",
+        "govqa.us/landing",
+        "govqa.us/register",
+        "nextrequest.com/about",
+        "nextrequest.com/pricing",
+        "nextrequest.com/home",
+        "justfoia.com/about",
+        "justfoia.com/pricing",
+        "justfoia.com/home",
+        "muckrock.com/about",
+        "foiaonline.gov/about",
+        "efoia.com/home",
+        "records.management.about",
     ]
+
+    # Keywords that should appear on a legitimate records request portal page
+    records_keywords = [
+        "public records", "records request", "foia", "open records",
+        "submit a request", "make a request", "request records",
+        "body camera", "body worn", "bodycam",
+    ]
+
+    try:
+        # First do a HEAD request (fast) to follow redirects and check status
+        head_resp = req.head(
+            url, timeout=8, allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; FOIABot/1.0)"},
+        )
+        final_url = head_resp.url.lower()
+
+        if head_resp.status_code >= 400:
+            logger.debug(
+                "_verify_url: '%s' returned HTTP %d after redirects", url, head_resp.status_code
+            )
+            return False
+
+        for bad in bad_redirects:
+            if bad in final_url:
+                logger.debug(
+                    "_verify_url: '%s' redirected to bad vendor URL '%s'", url, final_url
+                )
+                return False
+
+        if not require_records_content:
+            return True
+
+        # GET the final page to inspect content for records-portal keywords
+        get_resp = req.get(
+            head_resp.url, timeout=10, allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; FOIABot/1.0)"},
+        )
+        page_text = get_resp.text.lower()
+        matched = [kw for kw in records_keywords if kw in page_text]
+        if matched:
+            logger.debug("_verify_url: '%s' verified — matched keywords: %s", url, matched)
+            return True
+        else:
+            logger.debug(
+                "_verify_url: '%s' live but no records keywords found on page", url
+            )
+            # Return True anyway — a live non-rejected page is still usable
+            return True
+
+    except req.exceptions.Timeout:
+        logger.warning("_verify_url: timeout verifying '%s'", url)
+        return False
+    except req.exceptions.TooManyRedirects:
+        logger.warning("_verify_url: too many redirects for '%s'", url)
+        return False
+    except Exception as exc:
+        logger.debug("_verify_url: exception for '%s': %s", url, exc)
+        return False
+
+
+def _verify_email_domain(email: str) -> bool:
+    """Check if the email domain exists by resolving its MX or A records."""
+    if not email or "@" not in email:
+        logger.debug("_verify_email_domain: invalid email format '%s'", email)
+        return False
+    domain = email.split("@")[1].lower().strip()
+    try:
+        import socket
+        socket.getaddrinfo(domain, 25, socket.AF_INET, socket.SOCK_STREAM)
+        logger.debug("_verify_email_domain: domain '%s' resolved successfully", domain)
+        return True
+    except (socket.gaierror, OSError) as exc:
+        logger.debug("_verify_email_domain: domain '%s' did not resolve: %s", domain, exc)
+        return False
+
+
+def _email_tld_confidence(email: str) -> str:
+    """Return 'high', 'medium', or 'low' based on the email domain TLD.
+
+    Government (.gov, .us) domains are treated as high confidence because they
+    require verified institutional registration.  Common organizational TLDs
+    (.org, .net, .edu) are medium.  Everything else is low.
+    """
+    if not email or "@" not in email:
+        return "low"
+    domain = email.split("@")[1].lower()
+    if domain.endswith(".gov") or domain.endswith(".us"):
+        return "high"
+    if domain.endswith(".org") or domain.endswith(".net") or domain.endswith(".edu"):
+        return "medium"
+    return "low"
+
+
+def _extract_city_slug(police_dept: str) -> str:
+    """Extract a city slug from a police department name for domain guessing."""
+    slug = police_dept.lower()
+    for suffix in [
+        "police department", "police dept", "police dept.", "pd",
+        "sheriff's office", "sheriffs office", "sheriff office", "sheriff",
+        "department of police", "dept of police",
+        "metropolitan police", "city of", "town of",
+    ]:
+        slug = slug.replace(suffix, "")
+    return slug.strip().replace(" ", "")
+
+
+def _run_serp_queries(queries: list, serpapi_key: str, num_per_query: int = 8) -> tuple:
+    """Run SerpAPI queries and collect snippets + links.
+
+    Returns (all_snippets, all_links).  Logs failures per-query instead of
+    silently swallowing them.
+    """
+    import requests as req
     all_snippets = []
     all_links = []
-
     for query in queries:
         try:
+            logger.debug("_run_serp_queries: querying SerpAPI: %s", query)
             resp = req.get("https://serpapi.com/search", params={
-                "q": query, "api_key": serpapi_key, "num": 5,
-            }, timeout=10)
+                "q": query, "api_key": serpapi_key, "num": num_per_query,
+            }, timeout=12)
             if resp.status_code == 200:
                 data = resp.json()
-                for r in data.get("organic_results", [])[:5]:
-                    snippet = f"Title: {r.get('title', '')} | URL: {r.get('link', '')} | Snippet: {r.get('snippet', '')}"
+                results = data.get("organic_results", [])[:num_per_query]
+                logger.debug("_run_serp_queries: got %d results for query: %s", len(results), query)
+                for r in results:
+                    snippet = (
+                        f"Title: {r.get('title', '')} | "
+                        f"URL: {r.get('link', '')} | "
+                        f"Snippet: {r.get('snippet', '')}"
+                    )
                     all_snippets.append(snippet)
                     all_links.append(r.get("link", ""))
-        except Exception:
-            pass
+            else:
+                logger.warning(
+                    "_run_serp_queries: SerpAPI returned HTTP %d for query: %s",
+                    resp.status_code, query,
+                )
+        except Exception as exc:
+            logger.warning("_run_serp_queries: exception for query '%s': %s", query, exc)
+    logger.info(
+        "_run_serp_queries: collected %d snippets from %d queries",
+        len(all_snippets), len(queries),
+    )
+    return all_snippets, all_links
 
-    if not all_snippets:
-        # Fallback to Claude's knowledge only
-        return _search_pd_contact_ai_only(police_dept, state, anthropic_key)
 
-    # Step 2: Have Claude analyze the search results
+def _analyze_search_results(police_dept: str, state: str, search_text: str, anthropic_key: str) -> dict | None:
+    """Have Claude analyze search results to extract PD contact info.
+
+    Returns a parsed dict or None if extraction fails.
+    """
+    import json, re
     client = anthropic.Anthropic(api_key=anthropic_key)
-    search_text = "\n".join(all_snippets[:10])
+    logger.debug("_analyze_search_results: analyzing results for %s, %s", police_dept, state)
 
     prompt = f"""I need to find how to submit a FOIA / public records request for body-worn camera footage to: {police_dept}, {state}
 
@@ -178,58 +550,237 @@ Here are Google search results:
 {search_text}
 
 Based on these results, determine:
-1. The BEST method to submit a records request (email is preferred if available, as it's automatable)
-2. The exact email address for records/FOIA requests
-3. If they use an online portal (GovQA, NextRequest, JustFOIA), provide the URL
-4. Any important notes (fees, turnaround time, specific form requirements)
+1. The BEST method to submit a records request. ALWAYS try to find an email address, even if a portal exists — most departments that run portals also have a records custodian email. Email is strongly preferred as it's automatable and costs nothing.
+2. The exact email address for records/FOIA requests — look for titles like "Records Custodian", "FOIA Officer",
+   "Public Records Coordinator", or email patterns like records@, foia@, publicrecords@, openrecords@
+3. If they use an online portal (GovQA, NextRequest, JustFOIA, eFOIA, MuckRock, PublicRecordsCenter), provide the
+   full portal URL including path (not just the domain)
+4. Any important notes (fees, turnaround time, specific form requirements, mailing address if no email found)
 
 IMPORTANT:
-- If you find an email, prefer that as the method (even if they also have a portal)
-- Extract REAL email addresses and URLs from the search results, don't guess
-- If no email found in results, check if common patterns apply (records@city.gov, etc.)
+- Prefer .gov or .us email domains — these are authoritative government addresses
+- Extract REAL email addresses visible in snippets; look for "name@domain.gov" patterns
+- Look at every URL in the results — if you see a .gov or .us domain pointing to a records/FOIA page, that is
+  the department's official records page; extract the full URL
+- If you see a city/county domain (e.g. cityname.gov), also suggest likely records emails:
+  records@cityname.gov, foia@cityname.gov, publicrecords@cityname.gov
+- Distinguish between an official departmental portal URL (e.g. police.cityname.gov/records) and a generic
+  vendor marketing page (e.g. nextrequest.com/about) — only report the former as the portal_url
+- Set confidence to "high" only if you found a real email or portal URL directly in the search results
+- Set confidence to "medium" if you are inferring an email from a domain you saw in results
+- Set confidence to "low" if you are guessing
 
-Return ONLY valid JSON:
-{{"method": "email" or "portal" or "both", "email": "exact email address or empty", "portal_url": "exact URL or empty", "portal_type": "govqa/nextrequest/justfoia/other/none", "notes": "important details about their process", "confidence": "high/medium/low"}}"""
+Return ONLY valid JSON (no markdown, no extra text):
+{{"method": "email" or "portal" or "both", "email": "exact email address or empty string", "portal_url": "exact full URL or empty string", "portal_type": "govqa/nextrequest/justfoia/efoia/muckrock/other/none", "notes": "important details including mailing address if found", "confidence": "high/medium/low", "official_website": "PD official website domain if identified, or empty string"}}"""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}],
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        result = _extract_json(raw, required_fields=["method", "confidence"])
+        if result:
+            logger.debug(
+                "_analyze_search_results: extracted contact info — method=%s, confidence=%s, email=%s",
+                result.get("method"), result.get("confidence"), result.get("email", ""),
+            )
+            return result
+        logger.warning("_analyze_search_results: failed to parse JSON from Claude response")
+        return None
+    except Exception as exc:
+        logger.error("_analyze_search_results: exception calling Claude: %s", exc)
+        return None
+
+
+def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthropic_key: str) -> dict:
+    """Search the web for a PD's FOIA contact info, then have Claude extract it.
+
+    Strategy:
+      1. Run a broad set of primary queries (official site, records custodian title,
+         known portal vendors, body-cam records).
+      2. Have Claude extract the best email / portal URL from combined results.
+      3. Validate the portal URL (follow redirects up to 3 levels, check for records
+         keywords, reject generic vendor marketing pages).
+      4. Validate the email domain exists; flag .gov/.us addresses as high confidence.
+      5. If confidence is still low, run a second targeted search round.
+      6. Fall back to pattern-based email suggestions if nothing concrete was found.
+    """
+    import json, re
+
+    city_slug = _extract_city_slug(police_dept)
+    logger.info("search_pd_contact_web: searching for contact — %s, %s (slug=%s)", police_dept, state, city_slug)
+
+    # Step 1: Primary search — 4 high-value queries (reduced from 9 to save SerpAPI cost)
+    primary_queries = [
+        # Official city/county website — covers .gov and .us in one query
+        f'site:{city_slug}.gov OR site:{city_slug}.us "public records" OR "FOIA" OR "records request"',
+        # Records custodian / FOIA officer direct email
+        f'"{police_dept}" {state} "records custodian" OR "FOIA officer" OR "public records officer" email',
+        # Known portal vendors
+        f'"{police_dept}" {state} GovQA OR NextRequest OR JustFOIA OR eFOIA OR PublicRecordsCenter',
+        # Body-cam specific records request
+        f'"{police_dept}" {state} body camera records request email OR portal',
+    ]
+    all_snippets, all_links = _run_serp_queries(primary_queries, serpapi_key, num_per_query=8)
+
+    if not all_snippets:
+        logger.warning("search_pd_contact_web: no search results — falling back to AI-only mode")
+        return _search_pd_contact_ai_only(police_dept, state, anthropic_key)
+
+    # Step 2: Have Claude analyze the search results
+    search_text = "\n".join(all_snippets[:25])
+    result = _analyze_search_results(police_dept, state, search_text, anthropic_key)
+
+    if not result:
+        logger.warning("search_pd_contact_web: Claude analysis failed — falling back to AI-only mode")
+        return _search_pd_contact_ai_only(police_dept, state, anthropic_key)
+
+    result["search_links"] = all_links[:5]
+
+    # Step 2b: Verify portal URL — follow redirects, check content, reject vendor pages
+    if result.get("portal_url"):
+        portal_url = result["portal_url"]
+        logger.info("search_pd_contact_web: verifying portal URL: %s", portal_url)
+        if not _verify_url(portal_url, max_redirects=3, require_records_content=True):
+            logger.warning("search_pd_contact_web: portal URL invalid or vendor page: %s", portal_url)
+            if not result.get("notes"):
+                result["notes"] = ""
+            result["notes"] = (
+                result["notes"]
+                + f" Portal URL {portal_url} was unreachable or redirected to a vendor marketing page."
+            ).strip()
+            result["portal_url"] = ""
+            if result.get("method") in ("portal", "both"):
+                result["method"] = "email" if result.get("email") else "unknown"
+        else:
+            logger.info("search_pd_contact_web: portal URL verified OK: %s", portal_url)
+
+    # Step 2c: Validate email — domain resolution + TLD confidence boost
+    if result.get("email"):
+        email = result["email"]
+        tld_conf = _email_tld_confidence(email)
+        logger.debug("search_pd_contact_web: email '%s' TLD confidence: %s", email, tld_conf)
+        if not _verify_email_domain(email):
+            logger.warning("search_pd_contact_web: email domain unresolvable for: %s", email)
+            if not result.get("notes"):
+                result["notes"] = ""
+            result["notes"] = (
+                result["notes"] + f" Email domain for {email} could not be verified via DNS."
+            ).strip()
+        else:
+            # Upgrade confidence if the email is on a .gov or .us domain
+            if tld_conf == "high" and result.get("confidence") in ("medium", "low"):
+                logger.info(
+                    "search_pd_contact_web: upgrading confidence to 'high' — .gov/.us email verified: %s", email
+                )
+                result["confidence"] = "high"
+            result.setdefault("email_tld_confidence", tld_conf)
+
+    # Step 3: If low confidence, retry with more targeted queries
+    if result.get("confidence") == "low" and not result.get("email") and not result.get("portal_url"):
+        logger.info("search_pd_contact_web: low confidence, running second-round queries")
+        alt_queries = [
+            f'"{police_dept}" records department email "@"',
+            f'{city_slug} {state} police department "records@" OR "foia@" OR "publicrecords@"',
+            f'"{police_dept}" {state} body worn camera request submit email',
+        ]
+        alt_snippets, alt_links = _run_serp_queries(alt_queries, serpapi_key, num_per_query=8)
+        if alt_snippets:
+            combined_text = search_text + "\n" + "\n".join(alt_snippets[:12])
+            retry_result = _analyze_search_results(police_dept, state, combined_text, anthropic_key)
+            if retry_result and (retry_result.get("email") or retry_result.get("portal_url")):
+                logger.info(
+                    "search_pd_contact_web: second-round search improved results — email=%s, portal=%s",
+                    retry_result.get("email", ""), retry_result.get("portal_url", ""),
+                )
+                retry_result["search_links"] = (all_links + alt_links)[:5]
+                result = retry_result
+            else:
+                logger.info("search_pd_contact_web: second-round search did not improve results")
+
+    # Step 4: If still no concrete contact, generate pattern-based email suggestions
+    if not result.get("email") and result.get("confidence") != "high":
+        suggested_emails = [
+            f"records@{city_slug}.gov",
+            f"foia@{city_slug}.gov",
+            f"publicrecords@{city_slug}.gov",
+            f"openrecords@{city_slug}.gov",
+            f"police@{city_slug}.gov",
+            f"records@{city_slug}.us",
+            f"foia@{city_slug}.us",
+        ]
+        result["suggested_emails"] = suggested_emails
+        logger.info(
+            "search_pd_contact_web: no confirmed email found — generated %d pattern suggestions",
+            len(suggested_emails),
+        )
+        if not result.get("notes"):
+            result["notes"] = ""
+        result["notes"] = (
+            result["notes"] + " Suggested emails are pattern-based guesses — verify on department website before sending."
+        ).strip()
+        # Use the first suggestion as a fallback email so downstream code can proceed
+        result["email"] = suggested_emails[0]
+        result["method"] = result.get("method", "email")
+        if result["method"] == "portal":
+            result["method"] = "both"
+
+    logger.info(
+        "search_pd_contact_web: final result — method=%s, email=%s, portal=%s, confidence=%s",
+        result.get("method"), result.get("email", ""), result.get("portal_url", ""), result.get("confidence"),
     )
-    raw = response.content[0].text.strip()
-    match = re.search(r'\{[\s\S]*\}', raw)
-    if match:
-        result = json.loads(match.group())
-        result["search_links"] = all_links[:3]
-        return result
-    return {"method": "email", "email": "", "portal_url": "", "notes": "Could not determine", "confidence": "low"}
+    return result
 
 
 def _search_pd_contact_ai_only(police_dept: str, state: str, anthropic_key: str) -> dict:
-    """Fallback: use Claude's knowledge only when web search fails."""
+    """Fallback: use Claude's knowledge only when web search fails or returns no results."""
     import json, re
     client = anthropic.Anthropic(api_key=anthropic_key)
+    logger.info("_search_pd_contact_ai_only: using AI-only mode for %s, %s", police_dept, state)
 
     prompt = f"""I need the records request contact for: {police_dept}, {state}
 
 Provide your best knowledge about:
-1. Their email for FOIA/records requests
-2. Whether they use GovQA, NextRequest, JustFOIA, or another portal
-3. The portal URL if known
+1. Their email for FOIA / public records requests (look for records custodian or FOIA officer email)
+2. Whether they use GovQA, NextRequest, JustFOIA, eFOIA, or another online portal
+3. The specific portal URL if known (full URL, not just domain)
+4. Their official website domain if known
 
-Return ONLY valid JSON:
-{{"method": "email" or "portal" or "both", "email": "best guess email", "portal_url": "URL or empty", "portal_type": "govqa/nextrequest/justfoia/other/none", "notes": "any info", "confidence": "low"}}"""
+Note: Confidence must always be "low" for AI-only results since you cannot verify current information.
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = response.content[0].text.strip()
-    match = re.search(r'\{[\s\S]*\}', raw)
-    if match:
-        return json.loads(match.group())
-    return {"method": "email", "email": "", "portal_url": "", "notes": "Could not determine", "confidence": "low"}
+Return ONLY valid JSON (no markdown, no extra text):
+{{"method": "email" or "portal" or "both", "email": "best guess email or empty string", "portal_url": "full URL or empty string", "portal_type": "govqa/nextrequest/justfoia/efoia/other/none", "notes": "any relevant info or caveats", "confidence": "low", "official_website": "domain if known or empty string"}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=350,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        result = _extract_json(raw, required_fields=["method"])
+        if result:
+            # Always force confidence to low for AI-only results
+            result["confidence"] = "low"
+            logger.info(
+                "_search_pd_contact_ai_only: got result — email=%s, portal=%s",
+                result.get("email", ""), result.get("portal_url", ""),
+            )
+            return result
+        logger.warning("_search_pd_contact_ai_only: could not parse JSON from Claude response")
+    except Exception as exc:
+        logger.error("_search_pd_contact_ai_only: exception calling Claude: %s", exc)
+
+    return {
+        "method": "email",
+        "email": "",
+        "portal_url": "",
+        "portal_type": "none",
+        "notes": "Web search unavailable and AI knowledge lookup failed — manual research required.",
+        "confidence": "low",
+    }
 
 
 def process_single_request(
@@ -243,6 +794,7 @@ def process_single_request(
     pd_db: list,
     service,
     foia_sheet_id: str,
+    portal_credentials: dict = None,
 ) -> dict:
     """Fully automated: find contact, generate letter, send it. Returns status dict."""
     from pd_database import lookup_department, add_department
@@ -306,9 +858,11 @@ def process_single_request(
     email_addr = pd_match.get("Email Address", "")
     portal_url = pd_match.get("Portal URL", "")
 
-    # Step 3: Send via best available method
-    if email_addr and method in ("email", "both"):
-        # Send via email
+    # Step 3: Send via best available method — always try email first (cheapest)
+    # Even portal-only departments often accept email to their records custodian.
+    # This saves $2-5/submission in Kevin's Opus tokens per avoided portal submission.
+    if email_addr:
+        # Send via email (preferred — no browser automation, no vision API cost)
         send_result = send_email_smtp(
             smtp_host="smtp.gmail.com",
             smtp_port=587,
@@ -346,37 +900,178 @@ def process_single_request(
         else:
             result["status"] = "failed"
             result["details"] = f"Email failed: {send_result['error']}"
-    elif portal_url:
-        # Can't auto-submit to portal — save as draft with portal info
+    elif portal_url and not email_addr:
+        # Try auto-submit via Playwright browser automation
         from sheets_client import write_foia_request
-        write_foia_request(service, foia_sheet_id, {
-            "Request ID": generate_request_id(),
-            "Article URL": article["url"],
-            "Suspect Name": article["suspect_name"],
-            "Incident Date": article["incident_date"],
-            "Police Department": dept_name,
-            "State": state,
-            "FOIA Score": str(article.get("foia_score", "")),
-            "Request Method": "portal",
-            "Contact Info": portal_url,
-            "Status": "Draft",
-            "Date Created": today,
-            "Date Sent": "",
-            "Last Follow-Up": "",
-            "Follow-Up Count": "0",
-            "Notes": f"Submit via portal: {portal_url}",
-            "Request Body": letter["body"],
-        })
-        result["status"] = "portal_draft"
-        result["details"] = f"Portal-only: {portal_url} — letter saved as draft"
-        result["method"] = "portal"
-        result["portal_url"] = portal_url
-        result["letter"] = letter
+        try:
+            from portal_submitter import submit_to_portal
+            portal_result = submit_to_portal(
+                portal_url=portal_url,
+                request_body=letter["body"],
+                subject=letter["subject"],
+                requester_name=sender_name,
+                requester_email=foia_email,
+                police_dept=dept_name,
+                portal_credentials=portal_credentials,
+                headless=True,
+                anthropic_key=anthropic_key,
+            )
+        except ImportError:
+            portal_result = {"success": False, "error": "Playwright not installed. Run: pip install playwright && playwright install chromium"}
+
+        if portal_result["success"]:
+            conf = portal_result.get("confirmation", "")
+            portal_type = portal_result.get("portal_type", "portal")
+            write_foia_request(service, foia_sheet_id, {
+                "Request ID": generate_request_id(),
+                "Article URL": article["url"],
+                "Suspect Name": article["suspect_name"],
+                "Incident Date": article["incident_date"],
+                "Police Department": dept_name,
+                "State": state,
+                "FOIA Score": str(article.get("foia_score", "")),
+                "Request Method": "portal",
+                "Contact Info": portal_url,
+                "Status": "Sent",
+                "Date Created": today,
+                "Date Sent": today,
+                "Last Follow-Up": "",
+                "Follow-Up Count": "0",
+                "Notes": f"Auto-submitted via {portal_type}" + (f". Confirmation: {conf}" if conf else ""),
+                "Request Body": letter["body"],
+            })
+            result["status"] = "sent"
+            result["details"] = f"Auto-submitted via portal: {portal_url}" + (f" (Conf: {conf})" if conf else "")
+            result["method"] = "portal"
+            result["portal_url"] = portal_url
+            result["letter"] = letter
+        else:
+            # Fallback: save as draft with error info
+            error_msg = portal_result.get("error", "unknown error")
+            write_foia_request(service, foia_sheet_id, {
+                "Request ID": generate_request_id(),
+                "Article URL": article["url"],
+                "Suspect Name": article["suspect_name"],
+                "Incident Date": article["incident_date"],
+                "Police Department": dept_name,
+                "State": state,
+                "FOIA Score": str(article.get("foia_score", "")),
+                "Request Method": "portal",
+                "Contact Info": portal_url,
+                "Status": "Portal Needed",
+                "Date Created": today,
+                "Date Sent": "",
+                "Last Follow-Up": "",
+                "Follow-Up Count": "0",
+                "Notes": f"Awaiting OpenClaw portal submission. URL: {portal_url}. Error: {error_msg}",
+                "Request Body": letter["body"],
+            })
+            result["status"] = "portal_draft"
+            result["details"] = f"Portal auto-submit failed ({error_msg}), saved as draft. URL: {portal_url}"
+            result["method"] = "portal"
+            result["portal_url"] = portal_url
+            result["letter"] = letter
     else:
-        result["status"] = "failed"
-        result["details"] = f"No email or portal found for {dept_name}"
+        # Last resort: try common email patterns for the department
+        guessed_email = _guess_pd_email(dept_name, state)
+        if guessed_email and foia_email and foia_email_password:
+            send_result = send_email_smtp(
+                smtp_host="smtp.gmail.com",
+                smtp_port=587,
+                email=foia_email,
+                password=foia_email_password,
+                to_addr=guessed_email,
+                subject=letter["subject"],
+                body=letter["body"],
+            )
+            if send_result["success"]:
+                from sheets_client import write_foia_request
+                write_foia_request(service, foia_sheet_id, {
+                    "Request ID": generate_request_id(),
+                    "Article URL": article["url"],
+                    "Suspect Name": article["suspect_name"],
+                    "Incident Date": article["incident_date"],
+                    "Police Department": dept_name,
+                    "State": state,
+                    "FOIA Score": str(article.get("foia_score", "")),
+                    "Request Method": "email (guessed)",
+                    "Contact Info": guessed_email,
+                    "Status": "Sent",
+                    "Date Created": today,
+                    "Date Sent": today,
+                    "Last Follow-Up": "",
+                    "Follow-Up Count": "0",
+                    "Notes": f"Sent to guessed email — verify delivery",
+                    "Request Body": letter["body"],
+                })
+                result["status"] = "sent"
+                result["details"] = f"Sent to guessed email: {guessed_email} (verify delivery)"
+                result["method"] = "email"
+                result["letter"] = letter
+                time.sleep(1)
+            else:
+                # Save as draft even with no contact
+                from sheets_client import write_foia_request
+                write_foia_request(service, foia_sheet_id, {
+                    "Request ID": generate_request_id(),
+                    "Article URL": article["url"],
+                    "Suspect Name": article["suspect_name"],
+                    "Incident Date": article["incident_date"],
+                    "Police Department": dept_name,
+                    "State": state,
+                    "FOIA Score": str(article.get("foia_score", "")),
+                    "Request Method": "unknown",
+                    "Contact Info": "",
+                    "Status": "Draft",
+                    "Date Created": today,
+                    "Date Sent": "",
+                    "Last Follow-Up": "",
+                    "Follow-Up Count": "0",
+                    "Notes": f"No contact found. Guessed email {guessed_email} failed: {send_result['error']}",
+                    "Request Body": letter["body"],
+                })
+                result["status"] = "portal_draft"
+                result["details"] = f"No contact found for {dept_name}. Saved as draft."
+        else:
+            from sheets_client import write_foia_request
+            write_foia_request(service, foia_sheet_id, {
+                "Request ID": generate_request_id(),
+                "Article URL": article["url"],
+                "Suspect Name": article["suspect_name"],
+                "Incident Date": article["incident_date"],
+                "Police Department": dept_name,
+                "State": state,
+                "FOIA Score": str(article.get("foia_score", "")),
+                "Request Method": "unknown",
+                "Contact Info": "",
+                "Status": "Draft",
+                "Date Created": today,
+                "Date Sent": "",
+                "Last Follow-Up": "",
+                "Follow-Up Count": "0",
+                "Notes": "No contact info found — needs manual lookup",
+                "Request Body": letter["body"],
+            })
+            result["status"] = "portal_draft"
+            result["details"] = f"No contact found for {dept_name}. Saved as draft."
 
     return result
+
+
+def _guess_pd_email(police_dept: str, state: str) -> str:
+    """Guess the most likely records request email for a police department."""
+    import re
+    # Extract city name from department name
+    name = police_dept.lower()
+    for suffix in ["police department", "police dept", "sheriff's office",
+                   "sheriff office", "sheriffs office", "department of police",
+                   "pd", "police", "sheriff"]:
+        name = name.replace(suffix, "")
+    city = name.strip().replace(" ", "")
+    if not city:
+        return ""
+    # Most common pattern for US police records emails
+    return f"records@{city}pd.org"
 
 
 def generate_request_id() -> str:

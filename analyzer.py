@@ -2,7 +2,43 @@
 
 import anthropic
 import json
+import logging
 import re
+import time
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_json(raw: str, required_fields: list = None) -> dict | None:
+    """Extract the first valid JSON object from raw text using balanced-brace scanning."""
+    raw = raw.strip()
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            if not required_fields or all(f in obj for f in required_fields):
+                return obj
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    start = None
+    for i, ch in enumerate(raw):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(raw[start:i + 1])
+                    if isinstance(obj, dict):
+                        if not required_fields or all(f in obj for f in required_fields):
+                            return obj
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    return None
+
 
 EXCLUDED_STATES = {
     "alabama", "arkansas", "delaware", "kansas", "kentucky",
@@ -129,42 +165,69 @@ ARTICLE TEXT
 EXTRACTION TASKS
 ═══════════════════════════════════════
 
-1. SUSPECT NAME — Extract the full name of the person arrested. If multiple suspects, separate with " / ". If no name found, say "Unknown".
+1. SUSPECT NAME — Full name of the person arrested. Multiple suspects: separate with " / ". If unknown: "Unknown".
 
-2. INCIDENT DATE — The date the crime/incident occurred (NOT the arrest date, NOT the publish date). Format: "Month Day, Year" (e.g. "March 4, 2026"). If unclear, use your best estimate from context.
+2. INCIDENT DATE — When the crime/incident occurred (NOT arrest date). Format: "Month Day, Year".
 
-3. ARREST DATE — The date the suspect was arrested. Format: "Month Day, Year".
+3. INCIDENT TIME — The time of day the incident occurred. Be as specific as possible:
+   - Exact time if stated: "3:45 PM", "11:30 AM"
+   - Approximate if implied: "early morning", "around midnight", "afternoon"
+   - If the article says "Tuesday evening" → "evening"
+   - If truly unknown: "Unknown"
 
-4. POLICE DEPARTMENT — The law enforcement agency that made the arrest or is handling the case. Full name.
+4. INCIDENT LOCATION — The specific location where the incident occurred:
+   - Street address if stated: "1200 block of Main Street"
+   - Intersection: "near Main St and 5th Ave"
+   - Landmark/business: "Walmart on Route 30", "outside the 7-Eleven at 450 Broad St"
+   - Area description: "parking lot of Eastland Mall"
+   - If only a city/area: "downtown Columbus" or "east side of Springfield"
+   - NEVER leave blank — always provide the most specific location available
 
-5. STATE — The US state where this happened. Full name (e.g. "Ohio", not "OH").
+5. ARREST DATE — When the suspect was arrested. Format: "Month Day, Year".
 
-6. SAME DAY ARREST — Did the arrest happen on the same calendar day as the crime/incident?
-   - Compare the CRIME/INCIDENT date (when the crime happened) vs the ARREST date (when they were arrested)
-   - If police responded to a crime AND arrested the suspect during that same response/pursuit → "Yes"
-   - If everything described is one continuous same-day event → "Yes"
-   - If crime was Day 1 but arrest was Day 2+ → "No"
-   - Only say "Unclear" if you genuinely cannot determine either date
+6. POLICE DEPARTMENT — Full name of the law enforcement agency.
 
-7. FOIA SCORE (0-10) — Rate suitability for a FOIA request:
-   - +3 for specific incident date AND location mentioned
-   - +3 for police department clearly named
-   - +2 for real narrative with specific details
-   - +2 for enough identifying info to file a request
-   - EXCLUDED STATES get automatic 0: {excluded_states}
-   - If the state is NOT in the excluded list, NEVER give 0
+7. STATE — Full US state name (e.g. "Ohio", not "OH").
 
-8. YOUTUBE SCORE (1-10) — Rate viral/YouTube potential based on severity:
-   - 8-10: child abuse/murder, officer shootings, deaths in custody, serial crimes, mass incidents
-   - 5-7: armed robbery with pursuit, serious assault, drug trafficking, kidnapping, standoffs
-   - 3-4: simple DUI, low-value shoplifting, minor possession, routine warrants
-   - 1-2: traffic violations, minor misdemeanors, paperwork crimes
+8. CHARGES — Specific charges filed against the suspect. List all mentioned:
+   - e.g. "aggravated assault, resisting arrest, possession of a firearm"
+   - If charges aren't specified: "Not specified"
+
+9. OFFICER NAMES — Names of officers involved (arresting, responding, or mentioned):
+   - e.g. "Officer John Smith, Sergeant Jane Doe"
+   - If not mentioned: "Not identified"
+
+10. CASE NUMBER — Any case number, incident report number, or reference number mentioned:
+    - e.g. "Case #2026-12345", "Report #26-0315-001"
+    - If not mentioned: ""
+
+11. VICTIM NAME — Name of the victim if mentioned. If not mentioned: ""
+
+12. SAME DAY ARREST — Did the arrest happen on the same calendar day as the crime?
+    - Same response/pursuit → "Yes"
+    - One continuous event → "Yes"
+    - Crime Day 1, arrest Day 2+ → "No"
+    - Cannot determine → "Unclear"
+
+13. FOIA SCORE (0-10):
+    - +3 for specific date AND location
+    - +3 for police department clearly named
+    - +2 for real narrative with specific details
+    - +2 for enough identifying info to file a request
+    - EXCLUDED STATES get automatic 0: {excluded_states}
+    - Non-excluded states: NEVER give 0
+
+14. YOUTUBE SCORE (1-10):
+    - 8-10: child abuse/murder, officer shootings, deaths in custody, serial crimes
+    - 5-7: armed robbery with pursuit, serious assault, kidnapping, standoffs
+    - 3-4: simple DUI, low-value shoplifting, minor possession
+    - 1-2: traffic violations, minor misdemeanors
 
 ═══════════════════════════════════════
 RESPONSE FORMAT
 ═══════════════════════════════════════
 Return ONLY valid JSON:
-{{"suspect_name": "...", "incident_date": "...", "arrest_date": "...", "police_dept": "...", "state": "...", "same_day_arrest": "Yes/No/Unclear", "foia_score": 8, "youtube_score": 5}}
+{{"suspect_name": "...", "incident_date": "...", "incident_time": "...", "incident_location": "...", "arrest_date": "...", "police_dept": "...", "state": "...", "charges": "...", "officer_names": "...", "case_number": "...", "victim_name": "...", "same_day_arrest": "Yes/No/Unclear", "foia_score": 8, "youtube_score": 5}}
 """
 
 
@@ -188,41 +251,53 @@ def analyze_found_article(api_key: str, article: dict, search_state: str = "",
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.content[0].text.strip()
-
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            result = json.loads(json_match.group())
-        else:
-            return {"error": f"No JSON found: {raw[:200]}"}
-
-        # Enforce excluded state rule
-        state_lower = result.get("state", "").strip().lower()
-        if state_lower in EXCLUDED_STATES:
-            result["foia_score"] = 0
-        elif result.get("foia_score") == 0:
-            result["foia_score"] = 1
-
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            result["foia_score"] = int(result["foia_score"])
-        except (ValueError, TypeError):
-            pass
-        try:
-            result["youtube_score"] = int(result["youtube_score"])
-        except (ValueError, TypeError):
-            pass
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.content[0].text.strip()
 
-        return result
+            result = _extract_json(raw, ["suspect_name", "foia_score"])
+            if result is None:
+                logger.warning("No valid JSON found in found-article response: %s", raw[:200])
+                return {"error": f"No JSON found: {raw[:200]}"}
 
-    except Exception as e:
-        return {"error": str(e)}
+            # Enforce excluded state rule
+            state_lower = result.get("state", "").strip().lower()
+            if state_lower in EXCLUDED_STATES:
+                result["foia_score"] = 0
+            elif result.get("foia_score") == 0:
+                result["foia_score"] = 1
+
+            try:
+                result["foia_score"] = int(result["foia_score"])
+            except (ValueError, TypeError):
+                pass
+            try:
+                result["youtube_score"] = int(result["youtube_score"])
+            except (ValueError, TypeError):
+                pass
+
+            logger.info("Found-article analysis succeeded for %s", article.get("url", "unknown"))
+            return result
+
+        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning("Retryable error (attempt %d/%d), waiting %ds: %s",
+                               attempt + 1, max_retries, wait, e)
+                time.sleep(wait)
+            else:
+                logger.warning("All %d attempts failed: %s", max_retries, e)
+                return {"error": str(e)}
+        except Exception as e:
+            logger.warning("Non-retryable error in found-article analysis: %s", e)
+            return {"error": str(e)}
 
 
 def analyze_article(api_key: str, article: dict, sheet_row: dict = None) -> dict:
@@ -250,57 +325,68 @@ def analyze_article(api_key: str, article: dict, sheet_row: dict = None) -> dict
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.content[0].text.strip()
-
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            result = json.loads(json_match.group())
-        else:
-            return {"error": f"No JSON found in response: {raw[:200]}"}
-
-        # ENFORCE excluded state rule in code
-        state_lower = sheet_state.strip().lower()
-        is_excluded = state_lower in EXCLUDED_STATES
-
-        if is_excluded:
-            result["foia_score"] = 0
-            result["foia_reasoning"] = f"State ({sheet_state}) is on the excluded list — automatic 0."
-        else:
-            if result.get("foia_score") == 0:
-                result["foia_score"] = 1
-                result["foia_reasoning"] = (
-                    result.get("foia_reasoning", "") +
-                    " (Adjusted: state not excluded, minimum 1.)"
-                )
-
-        # Ensure scores are integers
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            result["foia_score"] = int(result["foia_score"])
-        except (ValueError, TypeError):
-            pass
-        try:
-            result["youtube_score"] = int(result["youtube_score"])
-        except (ValueError, TypeError):
-            pass
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.content[0].text.strip()
 
-        return result
+            result = _extract_json(raw, ["foia_score", "youtube_score"])
+            if result is None:
+                logger.warning("No valid JSON found in analysis response: %s", raw[:200])
+                return {"error": f"No JSON found in response: {raw[:200]}"}
 
-    except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {e}"}
-    except anthropic.AuthenticationError:
-        return {"error": "Invalid Anthropic API key."}
-    except anthropic.APIConnectionError:
-        return {"error": "Cannot connect to Anthropic API. Check internet."}
-    except anthropic.RateLimitError:
-        return {"error": "Rate limit hit. Wait a moment and retry."}
-    except anthropic.APIError as e:
-        return {"error": f"Claude API error: {e}"}
-    except Exception as e:
-        return {"error": f"Analysis failed: {e}"}
+            # ENFORCE excluded state rule in code
+            state_lower = sheet_state.strip().lower()
+            is_excluded = state_lower in EXCLUDED_STATES
+
+            if is_excluded:
+                result["foia_score"] = 0
+                result["foia_reasoning"] = f"State ({sheet_state}) is on the excluded list — automatic 0."
+            else:
+                if result.get("foia_score") == 0:
+                    result["foia_score"] = 1
+                    result["foia_reasoning"] = (
+                        result.get("foia_reasoning", "") +
+                        " (Adjusted: state not excluded, minimum 1.)"
+                    )
+
+            # Ensure scores are integers
+            try:
+                result["foia_score"] = int(result["foia_score"])
+            except (ValueError, TypeError):
+                pass
+            try:
+                result["youtube_score"] = int(result["youtube_score"])
+            except (ValueError, TypeError):
+                pass
+
+            logger.info("Article analysis succeeded for %s", article.get("url", "unknown"))
+            return result
+
+        except (anthropic.RateLimitError, anthropic.APIConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning("Retryable error (attempt %d/%d), waiting %ds: %s",
+                               attempt + 1, max_retries, wait, e)
+                time.sleep(wait)
+            else:
+                logger.warning("All %d attempts failed: %s", max_retries, e)
+                return {"error": str(e)}
+        except json.JSONDecodeError as e:
+            logger.warning("JSON parse error: %s", e)
+            return {"error": f"JSON parse error: {e}"}
+        except anthropic.AuthenticationError:
+            logger.warning("Invalid Anthropic API key")
+            return {"error": "Invalid Anthropic API key."}
+        except anthropic.APIError as e:
+            logger.warning("Claude API error: %s", e)
+            return {"error": f"Claude API error: {e}"}
+        except Exception as e:
+            logger.warning("Analysis failed: %s", e)
+            return {"error": f"Analysis failed: {e}"}

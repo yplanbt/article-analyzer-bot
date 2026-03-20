@@ -3,10 +3,34 @@
 import os
 import re
 import json
+import time
+import random
+import logging
+import threading
+from datetime import datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+logger = logging.getLogger(__name__)
+
+# Serialize all Google Sheets API calls to prevent concurrent SSL connections
+# from triggering OpenSSL memory corruption on Python 3.13 + macOS ARM64.
+_api_lock = threading.Lock()
+
+
+def _retry(fn, max_retries=4, delay=2):
+    """Retry a Google API call with exponential backoff + jitter."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = min(delay * (2 ** attempt) + random.uniform(0, 1), 60)
+            logger.warning(f"Sheets API retry {attempt+1}/{max_retries}: {e}")
+            time.sleep(wait)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -67,6 +91,29 @@ def get_sheets_service(client_secret_path: str = CLIENT_SECRET_PATH):
     """Authenticate via OAuth2 and return a Google Sheets API service."""
     creds = _get_creds(client_secret_path)
     return build("sheets", "v4", credentials=creds)
+
+
+def _locked_execute(original_execute):
+    """Wrap an HttpRequest.execute() to serialize SSL connections."""
+    def wrapper(*args, **kwargs):
+        with _api_lock:
+            return original_execute(*args, **kwargs)
+    return wrapper
+
+
+# Monkey-patch googleapiclient to serialize all .execute() calls.
+# This prevents concurrent SSL connections from crashing Python 3.13 on macOS ARM64.
+try:
+    from googleapiclient.http import HttpRequest as _HttpRequest
+    _orig_init = _HttpRequest.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        self.execute = _locked_execute(self.execute)
+
+    _HttpRequest.__init__ = _patched_init
+except Exception:
+    logger.warning("Could not patch HttpRequest for SSL thread safety")
 
 
 def get_all_rows(service, sheet_id: str, tab_name: str = "Sheet1") -> list[list[str]]:
@@ -165,12 +212,12 @@ def write_results_to_row(service, sheet_id: str, tab_name: str, row_num: int, re
         str(results.get("youtube_score", "")),
     ]
     range_name = f"{tab_name}!F{row_num}:I{row_num}"
-    service.spreadsheets().values().update(
+    _retry(lambda: service.spreadsheets().values().update(
         spreadsheetId=sheet_id,
         range=range_name,
         valueInputOption="RAW",
         body={"values": [values]},
-    ).execute()
+    ).execute())
 
 
 def create_new_sheet(service, title: str, make_public: bool = True) -> str:
@@ -200,13 +247,17 @@ def create_new_sheet(service, title: str, make_public: bool = True) -> str:
 
 
 def append_rows_to_sheet(service, sheet_id: str, tab_name: str, rows: list[list[str]]):
-    """Write rows to a sheet starting from A1."""
-    service.spreadsheets().values().update(
-        spreadsheetId=sheet_id,
-        range=f"{tab_name}!A1",
-        valueInputOption="RAW",
-        body={"values": rows},
-    ).execute()
+    """Write rows to a sheet starting from A1. Writes in chunks for reliability."""
+    CHUNK_SIZE = 50
+    for i in range(0, len(rows), CHUNK_SIZE):
+        chunk = rows[i:i + CHUNK_SIZE]
+        start_row = i + 1  # 1-indexed
+        _retry(lambda c=chunk, sr=start_row: service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"{tab_name}!A{sr}",
+            valueInputOption="RAW",
+            body={"values": c},
+        ).execute())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -274,13 +325,13 @@ def get_foia_requests(service, sheet_id: str) -> list[dict]:
 def write_foia_request(service, sheet_id: str, request_data: dict) -> None:
     """Append a new FOIA request to the Requests tab."""
     row = [request_data.get(h, "") for h in FOIA_HEADERS]
-    service.spreadsheets().values().append(
+    _retry(lambda: service.spreadsheets().values().append(
         spreadsheetId=sheet_id,
         range=f"{FOIA_TAB}!A:P",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [row]},
-    ).execute()
+    ).execute())
 
 
 def update_foia_row(service, sheet_id: str, row_num: int, updates: dict) -> None:
@@ -290,12 +341,12 @@ def update_foia_row(service, sheet_id: str, row_num: int, updates: dict) -> None
     for field, value in updates.items():
         if field in col_map:
             col = col_map[field]
-            service.spreadsheets().values().update(
+            _retry(lambda c=col, v=value: service.spreadsheets().values().update(
                 spreadsheetId=sheet_id,
-                range=f"{FOIA_TAB}!{col}{row_num}",
+                range=f"{FOIA_TAB}!{c}{row_num}",
                 valueInputOption="RAW",
-                body={"values": [[str(value)]]},
-            ).execute()
+                body={"values": [[str(v)]]},
+            ).execute())
 
 
 def get_existing_foia_urls(service, sheet_id: str) -> set:
@@ -308,6 +359,406 @@ def get_existing_foia_urls(service, sheet_id: str) -> set:
             .execute()
         )
         rows = result.get("values", [])
-        return {row[0].strip().lower() for row in rows[1:] if row}
+        return {_normalize_url(row[0]) for row in rows[1:] if row}
     except Exception:
         return set()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Article Archive
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ARCHIVE_TAB = "Archive"
+ARCHIVE_HEADERS = [
+    "URL", "Title", "Source", "Suspect Name", "Incident Date",
+    "Police Department", "State", "Search Query", "Date Found",
+    "FOIA Score", "YouTube Score", "Same Day Arrest", "FOIA Status",
+    "Charges", "Incident Location", "Officer Names", "Case Number",
+]
+
+
+def ensure_archive_headers(service, sheet_id: str) -> None:
+    """Ensure the Archive tab exists with proper headers."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{ARCHIVE_TAB}!A1:Q1")
+            .execute()
+        )
+        if not result.get("values"):
+            _write_archive_headers(service, sheet_id)
+    except Exception:
+        try:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": ARCHIVE_TAB}}}]},
+            ).execute()
+        except Exception:
+            pass
+        _write_archive_headers(service, sheet_id)
+
+
+def _write_archive_headers(service, sheet_id: str) -> None:
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{ARCHIVE_TAB}!A1:Q1",
+        valueInputOption="RAW",
+        body={"values": [ARCHIVE_HEADERS]},
+    ).execute()
+
+
+def append_to_archive(service, sheet_id: str, articles: list[dict]) -> int:
+    """Append articles to the Archive tab, deduplicating by URL. Returns count added."""
+    existing_urls = set()
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{ARCHIVE_TAB}!A:A")
+            .execute()
+        )
+        rows = result.get("values", [])
+        existing_urls = {_normalize_url(row[0]) for row in rows[1:] if row}
+    except Exception:
+        pass
+
+    new_rows = []
+    for a in articles:
+        url = a.get("url", "").strip()
+        if not url or _normalize_url(url) in existing_urls:
+            continue
+        existing_urls.add(_normalize_url(url))
+        new_rows.append([
+            url,
+            a.get("title", ""),
+            a.get("source", ""),
+            a.get("suspect_name", ""),
+            a.get("incident_date", ""),
+            a.get("police_dept", ""),
+            a.get("state", ""),
+            a.get("search_query", ""),
+            a.get("date_found", datetime.now().strftime("%Y-%m-%d")),
+            str(a.get("foia_score", "")),
+            str(a.get("youtube_score", "")),
+            a.get("same_day_arrest", ""),
+            a.get("foia_status", ""),
+            a.get("charges", ""),
+            a.get("incident_location", ""),
+            a.get("officer_names", ""),
+            a.get("case_number", ""),
+        ])
+
+    if new_rows:
+        _retry(lambda: service.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{ARCHIVE_TAB}!A:Q",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": new_rows},
+        ).execute())
+
+    return len(new_rows)
+
+
+def get_archive_articles(service, sheet_id: str) -> list[dict]:
+    """Read all archived articles as dicts."""
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"{ARCHIVE_TAB}!A:Q")
+        .execute()
+    )
+    rows = result.get("values", [])
+    if len(rows) <= 1:
+        return []
+    headers = rows[0]
+    return [
+        {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        for row in rows[1:]
+    ]
+
+
+def update_archive_foia_status(service, sheet_id: str, url: str, status: str) -> None:
+    """Update the FOIA Status column for a given URL in the archive."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{ARCHIVE_TAB}!A:A")
+            .execute()
+        )
+        rows = result.get("values", [])
+        norm_target = _normalize_url(url)
+        for i, row in enumerate(rows[1:], start=2):
+            if row and _normalize_url(row[0]) == norm_target:
+                # Column M = FOIA Status (13th column)
+                _retry(lambda: service.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=f"{ARCHIVE_TAB}!M{i}",
+                    valueInputOption="RAW",
+                    body={"values": [[status]]},
+                ).execute())
+                return
+    except Exception as e:
+        logger.warning(f"Failed to update archive FOIA status: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Append Articles to Working Sheet (without overwriting)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def append_articles_to_working_sheet(service, sheet_id: str, tab_name: str, articles: list[dict]) -> int:
+    """Append analyzed articles to the working sheet without overwriting existing data. Returns count added."""
+    existing_urls = set()
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{tab_name}!A:A")
+            .execute()
+        )
+        rows = result.get("values", [])
+        existing_urls = {_normalize_url(row[0]) for row in rows[1:] if row}
+    except Exception:
+        pass
+
+    new_rows = []
+    for a in articles:
+        url = a.get("url", "").strip()
+        if not url or _normalize_url(url) in existing_urls:
+            continue
+        existing_urls.add(_normalize_url(url))
+        new_rows.append([
+            url,
+            a.get("suspect_name", ""),
+            a.get("incident_date", ""),
+            a.get("police_dept", ""),
+            a.get("state", ""),
+            a.get("duplicate", ""),
+            a.get("same_day_arrest", ""),
+            str(a.get("foia_score", "")),
+            str(a.get("youtube_score", "")),
+        ])
+
+    if new_rows:
+        _retry(lambda: service.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab_name}!A:I",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": new_rows},
+        ).execute())
+
+    return len(new_rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Activity Log
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ACTIVITY_TAB = "Activity Log"
+ACTIVITY_HEADERS = ["Timestamp", "Action", "Details", "Source"]
+
+
+def ensure_activity_headers(service, sheet_id: str) -> None:
+    """Ensure the Activity Log tab exists with proper headers."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{ACTIVITY_TAB}!A1:D1")
+            .execute()
+        )
+        if not result.get("values"):
+            _write_activity_headers(service, sheet_id)
+    except Exception:
+        try:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": ACTIVITY_TAB}}}]},
+            ).execute()
+        except Exception:
+            pass
+        _write_activity_headers(service, sheet_id)
+
+
+def _write_activity_headers(service, sheet_id: str) -> None:
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{ACTIVITY_TAB}!A1:D1",
+        valueInputOption="RAW",
+        body={"values": [ACTIVITY_HEADERS]},
+    ).execute()
+
+
+def log_activity(service, sheet_id: str, action: str, details: str, source: str = "App") -> None:
+    """Log an activity event to the Activity Log tab."""
+    try:
+        ensure_activity_headers(service, sheet_id)
+        row = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), action, details, source]
+        service.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{ACTIVITY_TAB}!A:D",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+    except Exception as e:
+        logger.warning(f"Failed to log activity: {e}")
+
+
+def get_recent_activity(service, sheet_id: str, limit: int = 20) -> list[dict]:
+    """Read the most recent activity log entries."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{ACTIVITY_TAB}!A:D")
+            .execute()
+        )
+        rows = result.get("values", [])
+        if len(rows) <= 1:
+            return []
+        headers = rows[0]
+        entries = [
+            {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+            for row in rows[1:]
+        ]
+        # Return most recent first
+        entries.reverse()
+        return entries[:limit]
+    except Exception:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Monitor Agent Status
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MONITOR_TAB = "Monitor"
+MONITOR_HEADERS = ["Timestamp", "Status", "Last Action", "Articles Queued", "FOIA Queued", "Portal Queued", "Errors", "Kevin Trigger"]
+
+
+def ensure_monitor_headers(service, sheet_id: str) -> None:
+    """Ensure the Monitor tab exists with proper headers."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{MONITOR_TAB}!A1:H1")
+            .execute()
+        )
+        if not result.get("values"):
+            _write_monitor_headers(service, sheet_id)
+    except Exception:
+        try:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": MONITOR_TAB}}}]},
+            ).execute()
+        except Exception:
+            pass
+        _write_monitor_headers(service, sheet_id)
+
+
+def _write_monitor_headers(service, sheet_id: str) -> None:
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{MONITOR_TAB}!A1:H1",
+        valueInputOption="RAW",
+        body={"values": [MONITOR_HEADERS]},
+    ).execute()
+
+
+def write_monitor_heartbeat(service, sheet_id: str, status: str, last_action: str = "",
+                            articles_queued: int = 0, foia_queued: int = 0,
+                            portal_queued: int = 0, errors: str = "") -> None:
+    """Write monitor agent heartbeat to row 2 (overwrites previous)."""
+    try:
+        ensure_monitor_headers(service, sheet_id)
+        row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            status, last_action,
+            str(articles_queued), str(foia_queued), str(portal_queued), errors,
+        ]
+        service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"{MONITOR_TAB}!A2:G2",
+            valueInputOption="RAW",
+            body={"values": [row]},
+        ).execute()
+    except Exception as e:
+        logger.warning(f"Failed to write monitor heartbeat: {e}")
+
+
+def read_monitor_status(service, sheet_id: str) -> dict:
+    """Read the current monitor agent status."""
+    try:
+        ensure_monitor_headers(service, sheet_id)
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{MONITOR_TAB}!A2:G2")
+            .execute()
+        )
+        rows = result.get("values", [])
+        if not rows or not rows[0]:
+            return {}
+        row = rows[0]
+        while len(row) < 7:
+            row.append("")
+        return {
+            "timestamp": row[0],
+            "status": row[1],
+            "last_action": row[2],
+            "articles_queued": row[3],
+            "foia_queued": row[4],
+            "portal_queued": row[5],
+            "errors": row[6],
+        }
+    except Exception:
+        return {}
+
+
+def write_kevin_trigger(service, sheet_id: str, value: str = "GO") -> None:
+    """Write a trigger signal to the Monitor tab for Kevin's Ollama heartbeat to pick up.
+    Kevin's local Ollama checks H3 — if 'GO', it triggers the OpenClaw skill manually."""
+    try:
+        ensure_monitor_headers(service, sheet_id)
+        service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"{MONITOR_TAB}!H3",
+            valueInputOption="RAW",
+            body={"values": [[value]]},
+        ).execute()
+    except Exception as e:
+        logger.warning(f"Failed to write Kevin trigger: {e}")
+
+
+def read_kevin_trigger(service, sheet_id: str) -> str:
+    """Read the Kevin trigger cell. Returns the cell value or empty string."""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=sheet_id, range=f"{MONITOR_TAB}!H3")
+            .execute()
+        )
+        rows = result.get("values", [])
+        return rows[0][0] if rows and rows[0] else ""
+    except Exception:
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Service Account Auth (for headless operation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_service_account_sheets(sa_key_path: str):
+    """Authenticate via service account and return a Google Sheets API service."""
+    from google.oauth2 import service_account
+    creds = service_account.Credentials.from_service_account_file(
+        sa_key_path, scopes=SCOPES,
+    )
+    return build("sheets", "v4", credentials=creds)
