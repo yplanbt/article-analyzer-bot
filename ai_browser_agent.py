@@ -74,7 +74,7 @@ def _get_stealth_script() -> str:
     """
 
 
-def _detect_captcha_js(page) -> dict | None:
+def _detect_captcha_js(page) -> "dict | None":
     """Detect CAPTCHAs via JavaScript (catches invisible ones Claude can't see)."""
     try:
         return page.evaluate("""
