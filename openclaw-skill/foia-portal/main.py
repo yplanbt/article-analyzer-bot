@@ -1,27 +1,44 @@
 """OpenClaw FOIA Portal Submission Skill.
 
 Reads the FOIA Google Sheet for rows with Status = "Portal Needed",
-then uses OpenClaw's browser to navigate to the portal, fill the form,
-and submit the FOIA request.
+then uses ai_browser_agent.py (GPT-4o vision + Playwright + 2captcha)
+to navigate the portal, fill the form, solve CAPTCHAs, and submit.
 
 Setup:
-  1. pip install gspread google-auth
-  2. Place Google Service Account key at ~/.openclaw/workspace/google-sa-key.json
-  3. Share the FOIA sheet with the service account email
-  4. Copy this skill to ~/.openclaw/workspace/skills/foia-portal/
+  1. pip install gspread google-auth openai playwright
+  2. playwright install chromium
+  3. Place Google Service Account key at ~/.openclaw/workspace/google-sa-key.json
+  4. Set env vars: OPENAI_API_KEY, US_PROXY, CAPTCHA_API_KEY, BROWSER_HEADLESS=false
 """
 
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+
+# Ensure ai_browser_agent.py is importable from workspace root
+_WORKSPACE = os.path.expanduser("~/.openclaw/workspace")
+_SCRIPT_DIR = str(Path(__file__).resolve().parent.parent.parent)
+for _path in [_WORKSPACE, _SCRIPT_DIR]:
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 try:
     import gspread
     from google.oauth2.service_account import Credentials
 except ImportError:
     print("Missing dependencies. Run: pip install gspread google-auth")
+    sys.exit(1)
+
+try:
+    from ai_browser_agent import ai_submit_portal
+except ImportError:
+    print("ERROR: Cannot import ai_browser_agent. Make sure ai_browser_agent.py is in:")
+    print(f"  {_WORKSPACE}/ai_browser_agent.py")
+    print(f"  OR {_SCRIPT_DIR}/ai_browser_agent.py")
     sys.exit(1)
 
 
@@ -36,11 +53,48 @@ REQUESTER_EMAIL = CONFIG["requester_email"]
 REQUESTER_NAME = CONFIG["requester_name"]
 SA_KEY_PATH = os.path.expanduser(CONFIG["sa_key_path"])
 
-# Google Sheets scopes
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+# Max portal submissions per run (each can take 2-5 minutes)
+MAX_PER_RUN = int(os.environ.get("PORTAL_MAX_PER_RUN", "10"))
+
+
+# ── Rate-limit helpers ───────────────────────────────────────────────────────
+
+def _retry_on_429(fn, max_retries=3):
+    """Retry a gspread call with exponential backoff on 429."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 2 ** (attempt + 1)
+                print(f"  Rate limited, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    return fn()
+
+
+# Header column cache (avoids re-reading row 1 on every update)
+_HEADER_CACHE = {}  # type: Dict[int, Dict[str, Optional[int]]]
+
+
+def _get_col_indices(worksheet):
+    # type: (gspread.Worksheet) -> Dict[str, Optional[int]]
+    """Cache header->column mappings to avoid repeated API calls."""
+    ws_id = id(worksheet)
+    if ws_id not in _HEADER_CACHE:
+        headers = _retry_on_429(lambda: worksheet.row_values(1))
+        _HEADER_CACHE[ws_id] = {
+            "status": (headers.index("Status") + 1) if "Status" in headers else None,
+            "notes": (headers.index("Notes") + 1) if "Notes" in headers else None,
+            "date_sent": (headers.index("Date Sent") + 1) if "Date Sent" in headers else None,
+        }
+    return _HEADER_CACHE[ws_id]
 
 
 # ── Google Sheets helpers ────────────────────────────────────────────────────
@@ -52,10 +106,11 @@ def get_sheet_client():
 
 
 def get_pending_requests(client):
+    # type: (gspread.Client) -> Tuple[List[Dict], gspread.Worksheet]
     """Get all rows with Status = 'Portal Needed' from the Requests tab."""
     sheet = client.open_by_key(SHEET_ID)
     worksheet = sheet.worksheet("Requests")
-    all_rows = worksheet.get_all_records()
+    all_rows = _retry_on_429(lambda: worksheet.get_all_records())
 
     pending = []
     for i, row in enumerate(all_rows):
@@ -68,27 +123,32 @@ def get_pending_requests(client):
 
 
 def update_request_status(worksheet, row_index, status, notes="", date_sent=""):
-    """Update a request row's status, notes, and date sent."""
-    # Find column indices from headers
-    headers = worksheet.row_values(1)
-    status_col = headers.index("Status") + 1 if "Status" in headers else None
-    notes_col = headers.index("Notes") + 1 if "Notes" in headers else None
-    date_sent_col = headers.index("Date Sent") + 1 if "Date Sent" in headers else None
+    """Update a request row's status, notes, and date sent (batch update)."""
+    cols = _get_col_indices(worksheet)
+    cells = []
 
-    if status_col:
-        worksheet.update_cell(row_index, status_col, status)
-    if notes_col and notes:
-        existing_notes = worksheet.cell(row_index, notes_col).value or ""
-        new_notes = f"{notes} | {existing_notes}" if existing_notes else notes
-        worksheet.update_cell(row_index, notes_col, new_notes)
-    if date_sent_col and date_sent:
-        worksheet.update_cell(row_index, date_sent_col, date_sent)
+    if cols["status"]:
+        cells.append(gspread.Cell(row_index, cols["status"], status))
+    if cols["notes"] and notes:
+        try:
+            existing = _retry_on_429(
+                lambda: worksheet.cell(row_index, cols["notes"]).value
+            ) or ""
+        except Exception:
+            existing = ""
+        new_notes = f"{notes} | {existing}" if existing else notes
+        cells.append(gspread.Cell(row_index, cols["notes"], new_notes))
+    if cols["date_sent"] and date_sent:
+        cells.append(gspread.Cell(row_index, cols["date_sent"], date_sent))
+
+    if cells:
+        _retry_on_429(lambda: worksheet.update_cells(cells))
 
 
 # ── Activity logging & heartbeat ─────────────────────────────────────────────
 
 def log_to_activity(client, action, details):
-    """Write an entry to the Activity Log tab so the dashboard can see OpenClaw's work."""
+    """Write an entry to the Activity Log tab."""
     try:
         sheet = client.open_by_key(SHEET_ID)
         try:
@@ -105,14 +165,16 @@ def log_to_activity(client, action, details):
 
 
 def write_openclaw_heartbeat(client, status, last_action=""):
-    """Write OpenClaw heartbeat to Monitor tab row 3 (row 2 is for monitor_agent.py)."""
+    """Write OpenClaw heartbeat to Monitor tab row 3."""
     try:
         sheet = client.open_by_key(SHEET_ID)
         try:
             ws = sheet.worksheet("Monitor")
         except gspread.exceptions.WorksheetNotFound:
-            ws = sheet.add_worksheet("Monitor", rows=10, cols=7)
-            ws.update('A1:G1', [["Timestamp", "Status", "Last Action", "Articles Queued", "FOIA Queued", "Portal Queued", "Errors"]])
+            ws = sheet.add_worksheet("Monitor", rows=10, cols=8)
+            ws.update('A1:H1', [["Timestamp", "Status", "Last Action",
+                                  "Articles Queued", "FOIA Queued",
+                                  "Portal Queued", "Errors", "Kevin Trigger"]])
         ws.update('A3:G3', [[
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             status, last_action, "", "", "", ""
@@ -121,7 +183,17 @@ def write_openclaw_heartbeat(client, status, last_action=""):
         print(f"Warning: Could not write heartbeat: {e}")
 
 
-# ── Portal detection ─────────────────────────────────────────────────────────
+def clear_kevin_trigger(client):
+    """Clear the Kevin trigger cell (Monitor!H3) after processing."""
+    try:
+        sheet = client.open_by_key(SHEET_ID)
+        ws = sheet.worksheet("Monitor")
+        ws.update("H3", [[""]])
+    except Exception as e:
+        print(f"Warning: Could not clear Kevin trigger: {e}")
+
+
+# ── Portal detection (for logging) ──────────────────────────────────────────
 
 def detect_portal_type(url):
     """Detect the portal platform from URL."""
@@ -137,238 +209,136 @@ def detect_portal_type(url):
     return "unknown"
 
 
-# ── Browser instructions for OpenClaw ─────────────────────────────────────────
-
-def _extract_structured_fields(request_body):
-    """Try to extract structured fields from the FOIA letter body."""
-    import re
-    fields = {}
-    patterns = {
-        "incident_time": r"(?:Approximate Time|Time of Incident|Time):\s*(.+)",
-        "incident_location": r"(?:Location|Location of Occurrence|Address):\s*(.+)",
-        "case_number": r"(?:Incident Report|Case Number|Report Number|Case #):\s*(.+)",
-        "officer_names": r"(?:Involved Officer|Officer\(s\)|Officers?):\s*(.+)",
-        "charges": r"(?:Charges|Charge\(s\)):\s*(.+)",
-        "victim_name": r"(?:Victim|Victim\(s\)):\s*(.+)",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, request_body, re.IGNORECASE)
-        if match:
-            val = match.group(1).strip()
-            if val and val.lower() not in ("unknown", "n/a", "not available", "not identified", ""):
-                fields[key] = val
-    return fields
-
-
-def build_browser_instructions(request_data, portal_type):
-    """Build natural language instructions for OpenClaw's browser agent."""
-    portal_url = request_data.get("Contact Info", "")
-    suspect = request_data.get("Suspect Name", "Unknown")
-    incident_date = request_data.get("Incident Date", "")
-    subject = f"Public Records Request - {suspect} ({incident_date})"
-    body = request_data.get("Request Body", "")
-    dept = request_data.get("Police Department", "")
-
-    # Extract structured fields from the letter body
-    fields = _extract_structured_fields(body)
-
-    instructions = f"""
-TASK: Submit a FOIA/public records request through a police department portal.
-
-PORTAL URL: {portal_url}
-PORTAL TYPE: {portal_type}
-DEPARTMENT: {dept}
-
-REQUESTER INFO:
-- First Name: {REQUESTER_NAME.split()[0] if ' ' in REQUESTER_NAME else REQUESTER_NAME}
-- Last Name: {REQUESTER_NAME.split()[-1] if ' ' in REQUESTER_NAME else ''}
-- Email: {REQUESTER_EMAIL}
-
-STRUCTURED INCIDENT DETAILS (use these to fill individual form fields):
-- Suspect Name: {suspect}
-- Date of Incident: {incident_date}
-- Time of Incident: {fields.get('incident_time', 'See description')}
-- Location of Incident: {fields.get('incident_location', 'See description')}
-- Case/Report Number: {fields.get('case_number', 'Not available')}
-- Officer(s) Involved: {fields.get('officer_names', 'All responding officers')}
-- Charges: {fields.get('charges', 'See description')}
-- Victim Name: {fields.get('victim_name', '')}
-- Record Type: Body-Worn Camera (BWC) Footage
-- Subject Line: {subject}
-
-FULL REQUEST BODY (use for description/details fields):
-{body}
-
-STEPS:
-1. Navigate to {portal_url}
-2. If the URL doesn't work or redirects to a vendor page, search for "{dept} public records request" to find the correct portal
-3. Look for "Submit a Request", "New Request", "File a Request", or similar
-4. If login required:
-   a. Create account with email: {REQUESTER_EMAIL}, name: {REQUESTER_NAME}
-   b. Or log in if already registered
-5. Fill the form — IMPORTANT: Map fields carefully:
-   - First Name → {REQUESTER_NAME.split()[0] if ' ' in REQUESTER_NAME else REQUESTER_NAME}
-   - Last Name → {REQUESTER_NAME.split()[-1] if ' ' in REQUESTER_NAME else ''}
-   - Email → {REQUESTER_EMAIL}
-   - Date of Incident / Beginning Date → {incident_date}
-   - Time of Occurrence → {fields.get('incident_time', '')}
-   - Location of Occurrence → {fields.get('incident_location', '')}
-   - Incident/Report Number → {fields.get('case_number', '')}
-   - Suspect Name → {suspect}
-   - Record Type / Category → "Body Camera" or "Video" or "Other: Body-Worn Camera Footage"
-   - Description / Additional Info → paste the FULL REQUEST BODY above
-   - Preferred delivery → Electronic / Email
-6. Submit the form
-7. Screenshot the confirmation page
-8. Report: confirmation number, reference ID, and any follow-up instructions
-"""
-
-    if portal_type == "govqa":
-        instructions += "\nGovQA HINTS: 'Submit a Request' in left sidebar. Select 'Police Records' or 'Body Camera'. May have department dropdown.\n"
-    elif portal_type == "nextrequest":
-        instructions += "\nNextRequest HINTS: 'Make a Request' button top-right. Single text field for description. Check 'Video/Audio' document type.\n"
-    elif portal_type == "justfoia":
-        instructions += "\nJustFOIA HINTS: Multi-step form. Step 1: agency, Step 2: details, Step 3: contact, Step 4: submit.\n"
-    else:
-        instructions += "\nUNKNOWN PORTAL: Use judgment. Look for records/FOIA request forms. If it's a general contact form, use it.\n"
-
-    return instructions
-
-
-# ── Main execution ────────────────────────────────────────────────────────────
+# ── Main execution ───────────────────────────────────────────────────────────
 
 def run():
-    """Main skill entry point. Called by OpenClaw on heartbeat or manual trigger."""
+    """Main skill entry point. Called by OpenClaw on manual trigger."""
     print("FOIA Portal Skill: Starting...")
 
-    # Connect to Google Sheets
+    # 1. Connect to Google Sheets
     try:
         client = get_sheet_client()
         print("Google Sheets: Connected")
     except Exception as e:
         print(f"ERROR: Cannot connect to Google Sheets: {e}")
-        print(f"Make sure {SA_KEY_PATH} exists and the sheet is shared with the service account.")
         return
 
-    # Write heartbeat so the dashboard knows we're alive
     write_openclaw_heartbeat(client, "Running", "Starting portal scan")
 
-    # Get pending requests
+    # 2. Find all "Portal Needed" rows
     pending, worksheet = get_pending_requests(client)
 
     if not pending:
-        print("No pending portal requests found. Nothing to do.")
+        print("No pending portal requests found.")
         write_openclaw_heartbeat(client, "Idle", "No pending requests")
         return
 
-    print(f"Found {len(pending)} portal request(s) to process.")
-    log_to_activity(client, "Portal Scan", f"Found {len(pending)} pending request(s)")
+    # Limit per run to avoid very long executions
+    if len(pending) > MAX_PER_RUN:
+        print(f"Found {len(pending)} requests, processing first {MAX_PER_RUN}.")
+        pending = pending[:MAX_PER_RUN]
+    else:
+        print(f"Found {len(pending)} portal request(s) to process.")
 
-    results = {"submitted": 0, "failed": 0}
+    log_to_activity(client, "Portal Scan", f"Processing {len(pending)} request(s)")
 
+    submitted = 0
+    failed = 0
+
+    # 3. Process each row
     for item in pending:
         row_idx = item["row_index"]
         data = item["data"]
         dept = data.get("Police Department", "Unknown")
         suspect = data.get("Suspect Name", "Unknown")
-        portal_url = data.get("Contact Info", "")
+        portal_url = data.get("Contact Info", "").strip()
+        incident_date = data.get("Incident Date", "")
+        body = data.get("Request Body", "")
+        subject = f"Public Records Request - {suspect} ({incident_date})"
 
-        print(f"\nProcessing: {suspect} — {dept}")
-        print(f"Portal URL: {portal_url}")
+        print(f"\n{'─'*50}")
+        print(f"Row {row_idx}: {suspect} — {dept}")
+        print(f"Portal: {portal_url}")
 
+        # 3a. Validate URL
         if not portal_url or not portal_url.startswith("http"):
-            print(f"  SKIP: No valid portal URL")
-            update_request_status(
-                worksheet, row_idx,
-                status="Portal Failed",
-                notes="No valid portal URL found",
-            )
-            results["failed"] += 1
+            print("  SKIP: No valid portal URL")
+            update_request_status(worksheet, row_idx,
+                                  status="Portal Failed",
+                                  notes="No valid portal URL")
+            failed += 1
             continue
 
         portal_type = detect_portal_type(portal_url)
-        print(f"  Portal type: {portal_type}")
+        print(f"  Type: {portal_type}")
 
-        # Build instructions for OpenClaw's browser agent
-        instructions = build_browser_instructions(data, portal_type)
-
-        # Mark as in-progress
+        # 3b. Mark as "Submitting..."
         update_request_status(worksheet, row_idx, status="Submitting...")
 
-        # ── This is where OpenClaw's browser agent takes over ──
-        # The instructions are returned to the OpenClaw agent which will:
-        # 1. Open the browser
-        # 2. Navigate to the portal
-        # 3. Fill and submit the form
-        # 4. Report back
+        # 3c. Call ai_submit_portal() — this opens the browser and submits
+        print(f"  Launching AI browser agent...")
+        try:
+            result = ai_submit_portal(
+                portal_url=portal_url,
+                request_body=body,
+                subject=subject,
+                requester_name=REQUESTER_NAME,
+                requester_email=REQUESTER_EMAIL,
+                police_dept=dept,
+                openai_key=os.environ.get("OPENAI_API_KEY", ""),
+                proxy=os.environ.get("US_PROXY", ""),
+            )
+        except Exception as e:
+            result = {"success": False, "error": str(e)[:300]}
 
-        # For now, print the instructions so OpenClaw's agent can execute them
-        print(f"\n{'='*60}")
-        print("BROWSER INSTRUCTIONS FOR OPENCLAW AGENT:")
-        print(f"{'='*60}")
-        print(instructions)
-        print(f"{'='*60}\n")
+        # 3d/3e. Update sheet based on result
+        today = datetime.now().strftime("%Y-%m-%d")
 
-        # The OpenClaw agent will handle the browser interaction.
-        # After the agent completes, it should call complete_submission()
-        # with the result.
+        if result.get("success"):
+            confirmation = result.get("confirmation", "")
+            msg = result.get("message", "")
+            notes = "Submitted via AI browser agent"
+            if confirmation:
+                notes += f". Confirmation: {confirmation}"
+            elif msg:
+                notes += f". {msg[:150]}"
 
-        # For automated flow, we update status optimistically.
-        # The agent should update it to "Submitted via Portal" on success
-        # or "Portal Failed" on failure.
+            update_request_status(worksheet, row_idx,
+                                  status="Sent", notes=notes, date_sent=today)
+            log_to_activity(client, "Portal Submitted",
+                            f"{dept} — {suspect}" + (f": {confirmation}" if confirmation else ""))
+            print(f"  SUCCESS: {notes}")
+            submitted += 1
+        else:
+            error = result.get("error", "Unknown error")[:200]
+            steps = result.get("steps", [])
+            step_summary = f" (steps: {len(steps)})" if steps else ""
 
-    print(f"\nDone. Processed {len(pending)} request(s).")
-    print(f"  The OpenClaw browser agent should now execute the portal submissions.")
-    print(f"  Monitor via: openclaw logs --follow")
+            update_request_status(worksheet, row_idx,
+                                  status="Portal Failed",
+                                  notes=f"AI agent error{step_summary}: {error}")
+            log_to_activity(client, "Portal Failed",
+                            f"{dept} — {suspect}: {error[:100]}")
+            print(f"  FAILED: {error}")
+            failed += 1
 
-    return pending
+        # 3f. Rate limiting between submissions
+        if item != pending[-1]:
+            print("  Waiting 5s before next submission...")
+            time.sleep(5)
 
+    # 4. Clear the Kevin trigger cell
+    clear_kevin_trigger(client)
 
-def complete_submission(worksheet, row_index, success, confirmation="", error=""):
-    """Called after the browser agent completes a portal submission.
-
-    Args:
-        worksheet: The gspread worksheet object
-        row_index: Row number in the sheet
-        success: Whether the submission succeeded
-        confirmation: Confirmation number/text from the portal
-        error: Error message if failed
-    """
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    # Log to Activity Log for dashboard visibility
-    try:
-        client = get_sheet_client()
-    except Exception:
-        client = None
-
-    if success:
-        notes = f"Submitted via OpenClaw browser agent"
-        if confirmation:
-            notes += f". Confirmation: {confirmation}"
-        update_request_status(
-            worksheet, row_index,
-            status="Sent",
-            notes=notes,
-            date_sent=today,
-        )
-        print(f"  Row {row_index}: Submitted successfully")
-        if client:
-            log_to_activity(client, "Portal Submitted", f"Row {row_index} submitted successfully")
-            write_openclaw_heartbeat(client, "Idle", f"Submitted row {row_index}")
-    else:
-        update_request_status(
-            worksheet, row_index,
-            status="Portal Failed",
-            notes=f"OpenClaw browser error: {error}",
-        )
-        print(f"  Row {row_index}: Failed — {error}")
-        if client:
-            log_to_activity(client, "Portal Failed", f"Row {row_index}: {error}")
-            write_openclaw_heartbeat(client, "Error", f"Failed row {row_index}")
+    # 5. Log summary
+    summary = f"Done: {submitted} submitted, {failed} failed out of {len(pending)}"
+    print(f"\n{'═'*50}")
+    print(summary)
+    log_to_activity(client, "Portal Run Complete", summary)
+    write_openclaw_heartbeat(client, "Idle", summary)
 
 
-# ── Standalone execution ──────────────────────────────────────────────────────
+# ── Standalone execution ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     run()
