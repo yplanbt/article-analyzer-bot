@@ -116,28 +116,7 @@ def _take_screenshot(page) -> str:
     return base64.b64encode(screenshot_bytes).decode("utf-8")
 
 
-def _send_to_claude(client, screenshot_b64: str, task_context: str, history: list) -> dict:
-    """Send screenshot to Claude and get next action."""
-    messages = []
-
-    # Build conversation history
-    for entry in history[-6:]:  # Keep last 6 exchanges to stay in context
-        messages.append({"role": "user", "content": entry["user"]})
-        messages.append({"role": "assistant", "content": entry["assistant"]})
-
-    # Current step
-    user_content = [
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": screenshot_b64,
-            },
-        },
-        {
-            "type": "text",
-            "text": f"""You are a browser automation agent. Look at this screenshot and decide what to do next.
+VISION_PROMPT = """You are a browser automation agent. Look at this screenshot and decide what to do next.
 
 TASK: {task_context}
 
@@ -160,8 +139,64 @@ Rules:
 - If you're stuck or the page looks wrong, return done with success=false
 - For click actions, describe the element clearly (e.g., "button with text 'Submit'")
 - Prefer using visible text content for selectors: "text=Submit Request"
-- Return ONLY the JSON action, no other text""",
+- Return ONLY the JSON action, no other text"""
+
+
+def _send_to_vision(client, screenshot_b64: str, task_context: str, history: list, provider: str = "openai") -> dict:
+    """Send screenshot to vision model (OpenAI or Anthropic) and get next action."""
+    prompt_text = VISION_PROMPT.format(task_context=task_context)
+
+    if provider == "anthropic":
+        return _send_to_claude(client, screenshot_b64, prompt_text, history)
+    else:
+        return _send_to_openai(client, screenshot_b64, prompt_text, history)
+
+
+def _send_to_openai(client, screenshot_b64: str, prompt_text: str, history: list) -> dict:
+    """Send screenshot to OpenAI GPT-4o/GPT-5.4 vision and get next action."""
+    messages = []
+
+    for entry in history[-6:]:
+        messages.append({"role": "user", "content": entry["user"]})
+        messages.append({"role": "assistant", "content": entry["assistant"]})
+
+    user_content = [
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+        {"type": "text", "text": prompt_text},
+    ]
+    messages.append({"role": "user", "content": user_content})
+
+    response = client.chat.completions.create(
+        model=os.environ.get("OPENAI_VISION_MODEL", "gpt-4o"),
+        max_tokens=500,
+        messages=messages,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    json_match = re.search(r'\{[\s\S]*\}', raw)
+    if json_match:
+        return json.loads(json_match.group())
+    return {"action": "done", "success": False, "message": f"Could not parse action: {raw[:200]}"}
+
+
+def _send_to_claude(client, screenshot_b64: str, prompt_text: str, history: list) -> dict:
+    """Send screenshot to Claude Sonnet vision and get next action."""
+    messages = []
+
+    for entry in history[-6:]:
+        messages.append({"role": "user", "content": entry["user"]})
+        messages.append({"role": "assistant", "content": entry["assistant"]})
+
+    user_content = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": screenshot_b64,
+            },
         },
+        {"type": "text", "text": prompt_text},
     ]
     messages.append({"role": "user", "content": user_content})
 
@@ -172,7 +207,6 @@ Rules:
     )
 
     raw = response.content[0].text.strip()
-    # Extract JSON from response
     json_match = re.search(r'\{[\s\S]*\}', raw)
     if json_match:
         return json.loads(json_match.group())
@@ -467,10 +501,14 @@ def ai_submit_portal(
     requester_password: str = "",
     police_dept: str = "",
     anthropic_key: str = "",
+    openai_key: str = "",
     headless: bool = True,
     proxy: str = "",
 ) -> dict:
     """Use AI vision agent to navigate and submit through any portal.
+
+    Uses OpenAI (GPT-4o) by default for vision. Falls back to Anthropic (Claude Sonnet)
+    if OpenAI key is not available. Set OPENAI_API_KEY env var or pass openai_key.
 
     Args:
         portal_url: The FOIA portal URL
@@ -480,7 +518,8 @@ def ai_submit_portal(
         requester_email: Email for the request and account creation
         requester_password: Password for account creation/login
         police_dept: Department name for context
-        anthropic_key: Anthropic API key for Claude vision
+        anthropic_key: Anthropic API key for Claude vision (fallback)
+        openai_key: OpenAI API key for GPT-4o vision (preferred)
         headless: Run browser without visible window
         proxy: US proxy URL (e.g. http://user:pass@us.proxy.com:8080). Falls back to US_PROXY env var.
 
@@ -495,8 +534,28 @@ def ai_submit_portal(
             "error": "Playwright not installed. Run: pip install playwright && playwright install chromium",
         }
 
-    import anthropic
-    client = anthropic.Anthropic(api_key=anthropic_key)
+    # Prefer OpenAI (free via Kevin's subscription), fall back to Anthropic
+    _openai_key = openai_key or os.environ.get("OPENAI_API_KEY", "")
+    _anthropic_key = anthropic_key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    if _openai_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=_openai_key)
+            vision_provider = "openai"
+            logger.info("Using OpenAI for vision (GPT-4o)")
+        except ImportError:
+            return {"success": False, "error": "OpenAI package not installed. Run: pip install openai"}
+    elif _anthropic_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=_anthropic_key)
+            vision_provider = "anthropic"
+            logger.info("Using Anthropic for vision (Claude Sonnet)")
+        except ImportError:
+            return {"success": False, "error": "Anthropic package not installed. Run: pip install anthropic"}
+    else:
+        return {"success": False, "error": "No vision API key. Set OPENAI_API_KEY or ANTHROPIC_API_KEY"}
 
     # Resolve proxy: parameter > env var > none
     proxy_url = proxy or os.environ.get("US_PROXY", "")
@@ -597,11 +656,11 @@ INSTRUCTIONS:
                     steps_log.append(f"Step {step}: Screenshot failed")
                     break
 
-                # Ask Claude what to do
+                # Ask vision model what to do
                 try:
-                    action = _send_to_claude(client, screenshot_b64, task_context, history)
+                    action = _send_to_vision(client, screenshot_b64, task_context, history, vision_provider)
                 except Exception as e:
-                    steps_log.append(f"Step {step}: Claude error: {str(e)[:100]}")
+                    steps_log.append(f"Step {step}: Vision error: {str(e)[:100]}")
                     break
 
                 steps_log.append(f"Step {step}: {action.get('action', '?')} — {action.get('description', '')}")
