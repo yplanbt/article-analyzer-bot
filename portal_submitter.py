@@ -68,7 +68,16 @@ def submit_to_portal(
         with sync_playwright() as p:
             launch_args = {"headless": headless}
             if proxy_url:
-                launch_args["proxy"] = {"server": proxy_url}
+                # Parse proxy URL to extract username/password if embedded
+                # Format: http://username:password@host:port
+                from urllib.parse import urlparse
+                parsed = urlparse(proxy_url)
+                proxy_config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+                if parsed.username:
+                    proxy_config["username"] = parsed.username
+                if parsed.password:
+                    proxy_config["password"] = parsed.password
+                launch_args["proxy"] = proxy_config
             browser = p.chromium.launch(**launch_args)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
