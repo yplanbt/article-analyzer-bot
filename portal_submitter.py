@@ -346,15 +346,26 @@ def _register_justfoia(page, base_url, name, email):
     domain = base_url.replace("https://", "").replace("http://", "")
     password = "Foia" + hashlib.md5(domain.encode()).hexdigest()[:8] + "!1"
 
-    register_url = base_url + "/publicportal/home/register"
-    page.goto(register_url, wait_until="networkidle")
-    time.sleep(3)
+    # Try multiple known JustFOIA registration URL patterns
+    register_urls = [
+        base_url + "/account/register",
+        base_url + "/publicportal/home/register",
+        base_url + "/publicportal/account/register",
+    ]
+
+    page_loaded = False
+    for register_url in register_urls:
+        page.goto(register_url, wait_until="networkidle")
+        time.sleep(3)
+        title = page.title().lower()
+        if "restricted" not in title and "error" not in title:
+            page_loaded = True
+            break
 
     try:
-        # Check if registration page loaded
-        title = page.title().lower()
-        if "restricted" in title or "error" in title:
-            return {"success": False, "error": "Registration page not accessible"}
+        if not page_loaded:
+            _save_debug_screenshot(page, "justfoia_register")
+            return {"success": False, "error": "Registration page not accessible at any known URL"}
 
         name_parts = name.strip().split(" ", 1)
         first_name = name_parts[0]
@@ -525,6 +536,7 @@ def _submit_justfoia(page, url, body, subject, name, email, creds):
     """Submit through JustFOIA portal with auto-registration.
 
     Flow:
+    0. Try anonymous submission first (many JustFOIA portals allow it)
     1. If credentials exist → login → submit
     2. If no credentials → register → verify email → login → submit
     3. If registration fails → return needs_registration for manual handling
@@ -541,6 +553,35 @@ def _submit_justfoia(page, url, body, subject, name, email, creds):
         new_request_url = url
 
     try:
+        # Step 0: Try anonymous submission first
+        print(f"  Trying anonymous submission at {new_request_url}...")
+        page.goto(new_request_url, wait_until="networkidle")
+        time.sleep(3)
+
+        title = page.title().lower()
+        if "restricted" not in title:
+            # Page loaded — check if there's a form we can fill
+            form_elements = page.locator("input, textarea, select").count()
+            if form_elements > 2:
+                print(f"  Anonymous access works — found {form_elements} form elements")
+                _fill_justfoia_form(page, body, subject, name, email)
+                submitted = _click_submit(page)
+                if submitted:
+                    time.sleep(3)
+                    conf = _extract_confirmation(page)
+                    return {
+                        "success": True,
+                        "message": "Submitted via JustFOIA (anonymous)",
+                        "confirmation": conf,
+                        "portal_type": "justfoia",
+                    }
+                else:
+                    print(f"  Anonymous form fill succeeded but submit button not found, trying login flow...")
+            else:
+                print(f"  Anonymous page has {form_elements} form elements — not enough, trying login flow...")
+        else:
+            print(f"  Anonymous access restricted — trying login flow...")
+
         logged_in = False
         new_credentials = None
 
