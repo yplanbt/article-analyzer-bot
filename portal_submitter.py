@@ -6,6 +6,7 @@ Requires: playwright package + browsers installed locally.
 Run `playwright install chromium` once to set up.
 """
 
+import os
 import re
 import time
 from datetime import datetime
@@ -725,6 +726,14 @@ def _click_submit(page) -> bool:
         # FormCenter submit buttons
         "button.formSubmit", "input.formSubmit",
         "button:has-text('Submit Request')", "button:has-text('Send Request')",
+        # JustFOIA / Angular / React app buttons
+        "button:has-text('Save')", "button:has-text('Continue')",
+        "button:has-text('Next')", "button:has-text('Complete')",
+        "button.btn-primary", "button.btn-success",
+        "a.btn:has-text('Submit')", "a.btn-primary:has-text('Submit')",
+        # Any visible button that looks like submit
+        "button[class*='submit' i]", "button[class*='send' i]",
+        "input[value*='Submit' i]", "input[value*='Send' i]",
     ]:
         try:
             el = page.locator(selector)
