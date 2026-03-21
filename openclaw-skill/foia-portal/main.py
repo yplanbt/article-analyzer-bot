@@ -344,13 +344,27 @@ def run():
             ai_fallback = result.get("ai_fallback_error", "")
             fallback_note = f" | AI fallback: {ai_fallback[:100]}" if ai_fallback else ""
 
-            update_request_status(worksheet, row_idx,
-                                  status="Portal Failed",
-                                  notes=f"Failed after {MAX_ATTEMPTS} attempts{step_summary}: {error}{fallback_note}")
-            log_to_activity(client, "Portal Failed",
-                            f"{dept} — {suspect}: {error[:100]}")
-            print(f"  FAILED after {MAX_ATTEMPTS} attempts: {error}")
-            failed += 1
+            # System errors keep "Portal Needed" so they auto-retry next run
+            SYSTEM_ERRORS = ["playwright", "not installed", "network", "timeout",
+                             "connection", "dns", "proxy", "econnrefused",
+                             "chromium", "browser", "errno"]
+            is_system_error = any(kw in error.lower() for kw in SYSTEM_ERRORS)
+
+            if is_system_error:
+                update_request_status(worksheet, row_idx,
+                                      status="Portal Needed",
+                                      notes=f"System error (will retry): {error[:150]}")
+                log_to_activity(client, "Portal System Error",
+                                f"{dept} — {suspect}: {error[:100]}")
+                print(f"  SYSTEM ERROR (will retry next run): {error}")
+            else:
+                update_request_status(worksheet, row_idx,
+                                      status="Portal Failed",
+                                      notes=f"Failed after {MAX_ATTEMPTS} attempts{step_summary}: {error}{fallback_note}")
+                log_to_activity(client, "Portal Failed",
+                                f"{dept} — {suspect}: {error[:100]}")
+                print(f"  FAILED after {MAX_ATTEMPTS} attempts: {error}")
+                failed += 1
 
         # 3f. Rate limiting between submissions
         if item != pending[-1]:
