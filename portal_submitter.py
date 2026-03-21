@@ -286,47 +286,117 @@ def _submit_nextrequest(page, url, body, subject, name, email, creds):
 
 
 def _submit_justfoia(page, url, body, subject, name, email, creds):
-    """Submit through JustFOIA portal."""
-    page.goto(url, wait_until="networkidle")
-    time.sleep(2)
+    """Submit through JustFOIA portal.
+
+    JustFOIA portals follow pattern: *.justfoia.com/publicportal
+    The new request form is at /publicportal/home/newrequest
+    Fields: Request Description (textarea), First Name, Last Name, Email, Phone, Address
+    """
+    # Navigate directly to the new request form
+    if "/newrequest" not in url.lower():
+        base = url.rstrip("/")
+        if "/publicportal" in base:
+            new_request_url = base.rsplit("/publicportal", 1)[0] + "/publicportal/home/newrequest"
+        else:
+            new_request_url = base + "/publicportal/home/newrequest"
+    else:
+        new_request_url = url
+
+    page.goto(new_request_url, wait_until="networkidle")
+    time.sleep(3)
 
     try:
+        # JustFOIA uses specific field patterns
+        # Request Description — main textarea
         for selector in [
-            "text=Submit Request", "text=New Request", "text=Make a Request",
-            "a:has-text('Request')", "button:has-text('Request')",
+            "textarea[id*='description' i]", "textarea[id*='request' i]",
+            "textarea[name*='description' i]", "textarea[name*='request' i]",
+            "textarea[placeholder*='description' i]", "textarea[placeholder*='request' i]",
+            "textarea",
         ]:
             try:
-                if page.locator(selector).count() > 0:
-                    page.locator(selector).first.click()
-                    time.sleep(2)
+                el = page.locator(selector)
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.fill(body)
                     break
             except Exception:
                 continue
 
-        if creds and creds.get("email"):
-            _try_login(page, creds["email"], creds.get("password", ""))
-            time.sleep(2)
+        # Also try label-based filling
+        _fill_by_labels(page, body, subject, name, email)
 
-        _fill_form_fields(page, body, subject, name, email)
+        # First Name / Last Name (JustFOIA splits name)
+        name_parts = name.strip().split(" ", 1)
+        first_name = name_parts[0]
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+        for selector in [
+            "input[id*='first' i]", "input[name*='first' i]",
+            "input[placeholder*='first' i]",
+        ]:
+            try:
+                el = page.locator(selector)
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.fill(first_name)
+                    break
+            except Exception:
+                continue
+
+        for selector in [
+            "input[id*='last' i]", "input[name*='last' i]",
+            "input[placeholder*='last' i]",
+        ]:
+            try:
+                el = page.locator(selector)
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.fill(last_name)
+                    break
+            except Exception:
+                continue
+
+        # Email
+        for selector in [
+            "input[type='email']", "input[id*='email' i]",
+            "input[name*='email' i]", "input[placeholder*='email' i]",
+        ]:
+            try:
+                el = page.locator(selector)
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.fill(email)
+                    break
+            except Exception:
+                continue
+
+        # Phone (optional but often required)
+        _fill_phone_field(page, "000-000-0000")
+
+        # Check required boxes
+        _check_required_boxes(page)
+
+        # Submit
         submitted = _click_submit(page)
 
         if submitted:
             time.sleep(3)
+            conf = _extract_confirmation(page)
             return {
                 "success": True,
                 "message": "Submitted via JustFOIA",
+                "confirmation": conf,
                 "portal_type": "justfoia",
             }
         else:
+            _save_debug_screenshot(page, "justfoia")
             return {
                 "success": False,
-                "error": "Could not complete JustFOIA submission",
+                "error": "Could not complete JustFOIA submission — no submit button found",
                 "portal_type": "justfoia",
                 "needs_manual": True,
                 "page_url": page.url,
             }
 
     except Exception as e:
+        _save_debug_screenshot(page, "justfoia")
         return {"success": False, "error": f"JustFOIA error: {str(e)}", "portal_type": "justfoia"}
 
 
@@ -417,6 +487,7 @@ def _submit_generic(page, url, body, subject, name, email):
                 "portal_type": "generic",
             }
         else:
+            _save_debug_screenshot(page, "generic")
             return {
                 "success": False,
                 "error": "Could not auto-submit — unknown portal layout",
@@ -426,12 +497,38 @@ def _submit_generic(page, url, body, subject, name, email):
             }
 
     except Exception as e:
+        _save_debug_screenshot(page, "generic")
         return {"success": False, "error": f"Generic portal error: {str(e)}", "portal_type": "unknown"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helper functions
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _save_debug_screenshot(page, portal_type):
+    """Save a screenshot + page info for debugging failed submissions."""
+    try:
+        debug_dir = os.path.expanduser("~/.openclaw/workspace/debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"{debug_dir}/{portal_type}_{timestamp}"
+        page.screenshot(path=f"{filename}.png", full_page=True)
+        # Also dump visible form elements for debugging
+        forms_info = page.evaluate("""() => {
+            const inputs = document.querySelectorAll('input, textarea, select, button[type=submit]');
+            return Array.from(inputs).slice(0, 30).map(el => ({
+                tag: el.tagName, type: el.type || '', name: el.name || '',
+                id: el.id || '', placeholder: el.placeholder || '',
+                visible: el.offsetParent !== null
+            }));
+        }""")
+        with open(f"{filename}.json", "w") as f:
+            import json
+            json.dump({"url": page.url, "title": page.title(), "forms": forms_info}, f, indent=2)
+        print(f"  Debug saved: {filename}.png + .json")
+    except Exception as e:
+        print(f"  Could not save debug screenshot: {e}")
+
 
 def _try_login(page, email, password):
     """Try to log into a portal."""
