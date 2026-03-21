@@ -321,6 +321,45 @@ def detect_portal_type(url):
     return "unknown"
 
 
+# ── Email fallback helpers ───────────────────────────────────────────────────
+
+def _lookup_dept_email(client, dept_name, portal_url):
+    # type: (gspread.Client, str, str) -> str
+    """Look up department email from PD Database for email fallback."""
+    pd_db = _get_pd_database(client)
+    dept_lower = dept_name.lower().strip()
+
+    # Try matching by portal URL domain first
+    try:
+        from urllib.parse import urlparse
+        query_domain = urlparse(portal_url.lower()).hostname or ""
+    except Exception:
+        query_domain = ""
+
+    for entry in pd_db:
+        email = str(entry.get("Email Address", "")).strip()
+        if not email:
+            continue
+
+        # Match by portal domain
+        entry_url = str(entry.get("Portal URL", "")).lower().strip()
+        if query_domain and entry_url:
+            try:
+                from urllib.parse import urlparse
+                entry_domain = urlparse(entry_url).hostname or ""
+                if query_domain == entry_domain:
+                    return email
+            except Exception:
+                pass
+
+        # Match by department name
+        entry_dept = str(entry.get("Department Name", "")).lower().strip()
+        if dept_lower and entry_dept and (dept_lower in entry_dept or entry_dept in dept_lower):
+            return email
+
+    return ""
+
+
 # ── Main execution ───────────────────────────────────────────────────────────
 
 def run():
@@ -469,13 +508,52 @@ def run():
                 log_to_activity(client, "Portal System Error",
                                 f"{dept} — {suspect}: {error[:100]}")
                 print(f"  SYSTEM ERROR (will retry next run): {error}")
-            elif result.get("needs_registration"):
+            elif result.get("needs_registration") or "access restricted" in error.lower():
+                # Portal is locked — try sending via email as fallback
+                # Look up department email from PD Database
+                dept_email = _lookup_dept_email(client, dept, portal_url)
+                foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
+                foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
+
+                if dept_email and foia_password:
+                    print(f"  Portal restricted — falling back to email: {dept_email}")
+                    try:
+                        import smtplib
+                        import ssl
+                        from email.mime.text import MIMEText
+                        from email.mime.multipart import MIMEMultipart
+
+                        msg = MIMEMultipart()
+                        msg["From"] = foia_email
+                        msg["To"] = dept_email
+                        msg["Subject"] = subject
+                        msg.attach(MIMEText(body, "plain"))
+
+                        ctx = ssl.create_default_context()
+                        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                            server.starttls(context=ctx)
+                            server.login(foia_email, foia_password)
+                            server.sendmail(foia_email, dept_email, msg.as_string())
+
+                        update_request_status(worksheet, row_idx,
+                                              status="Sent",
+                                              notes=f"Portal restricted — sent via email to {dept_email}",
+                                              date_sent=today)
+                        log_to_activity(client, "Email Fallback Sent",
+                                        f"{dept} — {suspect}: emailed {dept_email}")
+                        print(f"  EMAIL FALLBACK SUCCESS: Sent to {dept_email}")
+                        submitted += 1
+                        continue
+                    except Exception as email_err:
+                        print(f"  Email fallback failed: {email_err}")
+                        error = f"Portal restricted, email fallback failed: {email_err}"
+
                 update_request_status(worksheet, row_idx,
                                       status="Manual Needed",
-                                      notes=f"Portal requires manual account registration: {error[:150]}")
+                                      notes=f"Portal restricted, no email available: {error[:150]}")
                 log_to_activity(client, "Portal Manual Needed",
                                 f"{dept} — {suspect}: needs manual registration")
-                print(f"  MANUAL NEEDED: Portal requires account registration")
+                print(f"  MANUAL NEEDED: Portal restricted, no email fallback available")
                 failed += 1
             else:
                 update_request_status(worksheet, row_idx,
