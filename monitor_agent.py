@@ -86,7 +86,7 @@ def get_service():
 
 
 def check_high_scoring(service) -> int:
-    """Find archive articles with FOIA score >= 7 not yet in Requests. Auto-create FOIA requests."""
+    """Find archive articles with any FOIA score not yet in Requests. Auto-create FOIA requests."""
     if not FOIA_EMAIL or not SERPAPI_KEY:
         logger.info("Skipping FOIA generation (no email or SerpAPI key)")
         return 0
@@ -103,8 +103,6 @@ def check_high_scoring(service) -> int:
     for a in archive:
         score_str = a.get("FOIA Score", "").strip()
         if not score_str or not score_str.isdigit():
-            continue
-        if int(score_str) < 7:
             continue
         url = a.get("URL", "").strip()
         if not url or _normalize_url(url) in existing_urls:
@@ -207,7 +205,7 @@ def get_queue_counts(service) -> dict:
 
         for a in archive:
             score = a.get("FOIA Score", "").strip()
-            if score.isdigit() and int(score) >= 7:
+            if score.isdigit():
                 url = a.get("URL", "").strip()
                 if url and _normalize_url(url) not in existing:
                     counts["foia"] += 1

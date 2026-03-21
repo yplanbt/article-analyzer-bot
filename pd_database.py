@@ -43,7 +43,7 @@ def get_pd_database(service, sheet_id: str) -> list[dict]:
         return []
 
 
-def lookup_department(pd_db: list[dict], dept_name: str, state: str) -> dict | None:
+def lookup_department(pd_db: list, dept_name: str, state: str) -> "dict | None":
     """Fuzzy-match a department against the database. Returns best match or None."""
     if not pd_db or not dept_name:
         return None

@@ -1,14 +1,15 @@
 """OpenClaw FOIA Portal Submission Skill.
 
 Reads the FOIA Google Sheet for rows with Status = "Portal Needed",
-then uses ai_browser_agent.py (GPT-4o vision + Playwright + 2captcha)
-to navigate the portal, fill the form, solve CAPTCHAs, and submit.
+then uses portal_submitter.py (hybrid: hardcoded flows for known portals
+like GovQA/NextRequest/JustFOIA + AI vision fallback for unknown ones).
 
 Setup:
-  1. pip install gspread google-auth openai playwright
+  1. pip install gspread google-auth openai anthropic playwright
   2. playwright install chromium
   3. Place Google Service Account key at ~/.openclaw/workspace/google-sa-key.json
-  4. Set env vars: OPENAI_API_KEY, US_PROXY, CAPTCHA_API_KEY, BROWSER_HEADLESS=false
+  4. Set env vars: ANTHROPIC_API_KEY, US_PROXY, CAPTCHA_API_KEY, BROWSER_HEADLESS=false
+  5. Copy portal_submitter.py, ai_browser_agent.py, captcha_solver.py to ~/.openclaw/workspace/
 """
 
 import json
@@ -34,12 +35,27 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from ai_browser_agent import ai_submit_portal
+    from portal_submitter import submit_to_portal
 except ImportError:
-    print("ERROR: Cannot import ai_browser_agent. Make sure ai_browser_agent.py is in:")
-    print(f"  {_WORKSPACE}/ai_browser_agent.py")
-    print(f"  OR {_SCRIPT_DIR}/ai_browser_agent.py")
-    sys.exit(1)
+    try:
+        from ai_browser_agent import ai_submit_portal
+        # Fallback wrapper if portal_submitter.py is not available
+        def submit_to_portal(portal_url, request_body, subject, requester_name,
+                             requester_email, police_dept="", portal_credentials=None,
+                             anthropic_key="", proxy="", **kwargs):
+            return ai_submit_portal(
+                portal_url=portal_url, request_body=request_body, subject=subject,
+                requester_name=requester_name, requester_email=requester_email,
+                police_dept=police_dept,
+                openai_key=os.environ.get("OPENAI_API_KEY", ""),
+                anthropic_key=anthropic_key, proxy=proxy,
+            )
+    except ImportError:
+        print("ERROR: Cannot import portal_submitter or ai_browser_agent.")
+        print(f"Make sure portal_submitter.py (preferred) or ai_browser_agent.py is in:")
+        print(f"  {_WORKSPACE}/")
+        print(f"  OR {_SCRIPT_DIR}/")
+        sys.exit(1)
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -275,21 +291,32 @@ def run():
         # 3b. Mark as "Submitting..."
         update_request_status(worksheet, row_idx, status="Submitting...")
 
-        # 3c. Call ai_submit_portal() — this opens the browser and submits
-        print(f"  Launching AI browser agent...")
-        try:
-            result = ai_submit_portal(
-                portal_url=portal_url,
-                request_body=body,
-                subject=subject,
-                requester_name=REQUESTER_NAME,
-                requester_email=REQUESTER_EMAIL,
-                police_dept=dept,
-                openai_key=os.environ.get("OPENAI_API_KEY", ""),
-                proxy=os.environ.get("US_PROXY", ""),
-            )
-        except Exception as e:
-            result = {"success": False, "error": str(e)[:300]}
+        # 3c. Submit via hybrid approach (hardcoded flows + AI fallback) with retry
+        MAX_ATTEMPTS = 2
+        result = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            print(f"  Attempt {attempt}/{MAX_ATTEMPTS}: Submitting to portal...")
+            try:
+                result = submit_to_portal(
+                    portal_url=portal_url,
+                    request_body=body,
+                    subject=subject,
+                    requester_name=REQUESTER_NAME,
+                    requester_email=REQUESTER_EMAIL,
+                    police_dept=dept,
+                    portal_credentials={"email": REQUESTER_EMAIL, "password": ""},
+                    anthropic_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+                    proxy=os.environ.get("US_PROXY", ""),
+                )
+            except Exception as e:
+                result = {"success": False, "error": str(e)[:300]}
+
+            if result.get("success"):
+                break
+            elif attempt < MAX_ATTEMPTS:
+                print(f"  Attempt {attempt} failed: {result.get('error', 'unknown')[:100]}")
+                print(f"  Retrying in 10s...")
+                time.sleep(10)
 
         # 3d/3e. Update sheet based on result
         today = datetime.now().strftime("%Y-%m-%d")
@@ -297,7 +324,8 @@ def run():
         if result.get("success"):
             confirmation = result.get("confirmation", "")
             msg = result.get("message", "")
-            notes = "Submitted via AI browser agent"
+            portal_type = result.get("portal_type", "unknown")
+            notes = f"Submitted via {portal_type}"
             if confirmation:
                 notes += f". Confirmation: {confirmation}"
             elif msg:
@@ -313,13 +341,15 @@ def run():
             error = result.get("error", "Unknown error")[:200]
             steps = result.get("steps", [])
             step_summary = f" (steps: {len(steps)})" if steps else ""
+            ai_fallback = result.get("ai_fallback_error", "")
+            fallback_note = f" | AI fallback: {ai_fallback[:100]}" if ai_fallback else ""
 
             update_request_status(worksheet, row_idx,
                                   status="Portal Failed",
-                                  notes=f"AI agent error{step_summary}: {error}")
+                                  notes=f"Failed after {MAX_ATTEMPTS} attempts{step_summary}: {error}{fallback_note}")
             log_to_activity(client, "Portal Failed",
                             f"{dept} — {suspect}: {error[:100]}")
-            print(f"  FAILED: {error}")
+            print(f"  FAILED after {MAX_ATTEMPTS} attempts: {error}")
             failed += 1
 
         # 3f. Rate limiting between submissions
@@ -338,7 +368,67 @@ def run():
     write_openclaw_heartbeat(client, "Idle", summary)
 
 
+# ── Auto-polling daemon ──────────────────────────────────────────────────────
+
+def poll(interval_seconds=120):
+    """Poll the Google Sheet for pending portal requests and auto-process them.
+
+    Checks Monitor!H3 for 'GO' signal, OR checks for any 'Portal Needed'
+    rows directly. This replaces the manual trigger flow so Kevin doesn't
+    need to be messaged to start processing.
+    """
+    print(f"FOIA Portal Skill: Auto-polling every {interval_seconds}s...")
+    print("Press Ctrl+C to stop.\n")
+
+    while True:
+        try:
+            client = get_sheet_client()
+
+            # Check 1: Is there a "GO" trigger signal?
+            triggered = False
+            try:
+                sheet = client.open_by_key(SHEET_ID)
+                ws = sheet.worksheet("Monitor")
+                trigger_val = ws.acell("H3").value or ""
+                if trigger_val.strip().upper() == "GO":
+                    print(f"[{datetime.now():%H:%M:%S}] GO signal detected — running...")
+                    triggered = True
+            except Exception:
+                pass
+
+            # Check 2: Any "Portal Needed" rows? (run even without GO signal)
+            if not triggered:
+                pending, _ = get_pending_requests(client)
+                if pending:
+                    print(f"[{datetime.now():%H:%M:%S}] {len(pending)} portal request(s) found — running...")
+                    triggered = True
+
+            if triggered:
+                run()
+            else:
+                print(f"[{datetime.now():%H:%M:%S}] No pending requests. Sleeping {interval_seconds}s...")
+
+        except KeyboardInterrupt:
+            print("\nStopping auto-poll.")
+            break
+        except Exception as e:
+            print(f"[{datetime.now():%H:%M:%S}] Error during poll: {e}")
+
+        time.sleep(interval_seconds)
+
+
 # ── Standalone execution ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    parser = argparse.ArgumentParser(description="FOIA Portal Submission Skill")
+    parser.add_argument("--poll", action="store_true",
+                        help="Run in auto-polling mode (checks for pending requests every 2 minutes)")
+    parser.add_argument("--interval", type=int, default=120,
+                        help="Polling interval in seconds (default: 120)")
+    args = parser.parse_args()
+
+    if args.poll:
+        poll(args.interval)
+    else:
+        run()

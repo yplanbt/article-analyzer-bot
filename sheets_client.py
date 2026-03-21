@@ -350,16 +350,28 @@ def update_foia_row(service, sheet_id: str, row_num: int, updates: dict) -> None
 
 
 def get_existing_foia_urls(service, sheet_id: str) -> set:
-    """Get all article URLs already in the FOIA tracking sheet."""
+    """Get article URLs that have been successfully sent (Status=Sent only).
+
+    Draft and Portal Needed requests are NOT included — they can be retried.
+    """
     try:
         result = (
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=sheet_id, range=f"{FOIA_TAB}!B:B")
+            .get(spreadsheetId=sheet_id, range=f"{FOIA_TAB}!B:J")
             .execute()
         )
         rows = result.get("values", [])
-        return {_normalize_url(row[0]) for row in rows[1:] if row}
+        sent_urls = set()
+        for row in rows[1:]:
+            if not row:
+                continue
+            url = row[0] if len(row) > 0 else ""
+            # Status is column J = index 8 relative to B (B=0, C=1, ..., J=8)
+            status = row[8] if len(row) > 8 else ""
+            if url and status.strip().lower() == "sent":
+                sent_urls.add(_normalize_url(url))
+        return sent_urls
     except Exception:
         return set()
 

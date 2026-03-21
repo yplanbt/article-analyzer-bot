@@ -485,7 +485,7 @@ Return ONLY valid JSON array:
         return [{"title": f"Error: {e}", "structure": "", "hook": "", "confidence": 0, "reasoning": ""}]
 
 
-def extract_video_id(url: str) -> str | None:
+def extract_video_id(url: str) -> "str | None":
     """Extract YouTube video ID from various URL formats."""
     patterns = [
         r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})',

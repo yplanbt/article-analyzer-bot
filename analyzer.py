@@ -9,7 +9,7 @@ import time
 logger = logging.getLogger(__name__)
 
 
-def _extract_json(raw: str, required_fields: list = None) -> dict | None:
+def _extract_json(raw: str, required_fields: list = None) -> "dict | None":
     """Extract the first valid JSON object from raw text using balanced-brace scanning."""
     raw = raw.strip()
     try:

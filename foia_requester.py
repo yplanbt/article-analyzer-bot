@@ -15,7 +15,7 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 
-def _extract_json(raw: str, required_fields: list = None) -> dict | None:
+def _extract_json(raw: str, required_fields: list = None) -> "dict | None":
     """Extract the first valid JSON object from raw text using balanced-brace scanning.
 
     More resilient than a simple regex: handles nested braces, trailing text, and
@@ -535,7 +535,7 @@ def _run_serp_queries(queries: list, serpapi_key: str, num_per_query: int = 8) -
     return all_snippets, all_links
 
 
-def _analyze_search_results(police_dept: str, state: str, search_text: str, anthropic_key: str) -> dict | None:
+def _analyze_search_results(police_dept: str, state: str, search_text: str, anthropic_key: str) -> "dict | None":
     """Have Claude analyze search results to extract PD contact info.
 
     Returns a parsed dict or None if extraction fails.
@@ -719,13 +719,10 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
         if not result.get("notes"):
             result["notes"] = ""
         result["notes"] = (
-            result["notes"] + " Suggested emails are pattern-based guesses — verify on department website before sending."
+            result["notes"] + f" Suggested (unverified): {', '.join(suggested_emails[:3])}"
         ).strip()
-        # Use the first suggestion as a fallback email so downstream code can proceed
-        result["email"] = suggested_emails[0]
-        result["method"] = result.get("method", "email")
-        if result["method"] == "portal":
-            result["method"] = "both"
+        # Do NOT auto-use guessed emails — they are unverified and will bounce
+        result["confidence"] = "low"
 
     logger.info(
         "search_pd_contact_web: final result — method=%s, email=%s, portal=%s, confidence=%s",
@@ -901,27 +898,36 @@ def process_single_request(
             result["status"] = "failed"
             result["details"] = f"Email failed: {send_result['error']}"
     elif portal_url and not email_addr:
-        # Try auto-submit via Playwright browser automation
+        # Queue for Kevin (OpenClaw) — he has AI browser agent + CAPTCHA solver
         from sheets_client import write_foia_request
-        try:
-            from portal_submitter import submit_to_portal
-            portal_result = submit_to_portal(
-                portal_url=portal_url,
-                request_body=letter["body"],
-                subject=letter["subject"],
-                requester_name=sender_name,
-                requester_email=foia_email,
-                police_dept=dept_name,
-                portal_credentials=portal_credentials,
-                headless=True,
-                anthropic_key=anthropic_key,
-            )
-        except ImportError:
-            portal_result = {"success": False, "error": "Playwright not installed. Run: pip install playwright && playwright install chromium"}
-
-        if portal_result["success"]:
-            conf = portal_result.get("confirmation", "")
-            portal_type = portal_result.get("portal_type", "portal")
+        write_foia_request(service, foia_sheet_id, {
+            "Request ID": generate_request_id(),
+            "Article URL": article["url"],
+            "Suspect Name": article["suspect_name"],
+            "Incident Date": article["incident_date"],
+            "Police Department": dept_name,
+            "State": state,
+            "FOIA Score": str(article.get("foia_score", "")),
+            "Request Method": "portal",
+            "Contact Info": portal_url,
+            "Status": "Portal Needed",
+            "Date Created": today,
+            "Date Sent": "",
+            "Last Follow-Up": "",
+            "Follow-Up Count": "0",
+            "Notes": f"Queued for Kevin. Portal: {portal_url}",
+            "Request Body": letter["body"],
+        })
+        result["status"] = "portal_draft"
+        result["details"] = f"Portal request queued for Kevin. URL: {portal_url}"
+        result["method"] = "portal"
+        result["portal_url"] = portal_url
+        result["letter"] = letter
+    else:
+        # No verified contact found — save as Draft for manual review
+        guessed_email = _guess_pd_email(dept_name, state)
+        if guessed_email:
+            from sheets_client import write_foia_request
             write_foia_request(service, foia_sheet_id, {
                 "Request ID": generate_request_id(),
                 "Article URL": article["url"],
@@ -930,108 +936,20 @@ def process_single_request(
                 "Police Department": dept_name,
                 "State": state,
                 "FOIA Score": str(article.get("foia_score", "")),
-                "Request Method": "portal",
-                "Contact Info": portal_url,
-                "Status": "Sent",
-                "Date Created": today,
-                "Date Sent": today,
-                "Last Follow-Up": "",
-                "Follow-Up Count": "0",
-                "Notes": f"Auto-submitted via {portal_type}" + (f". Confirmation: {conf}" if conf else ""),
-                "Request Body": letter["body"],
-            })
-            result["status"] = "sent"
-            result["details"] = f"Auto-submitted via portal: {portal_url}" + (f" (Conf: {conf})" if conf else "")
-            result["method"] = "portal"
-            result["portal_url"] = portal_url
-            result["letter"] = letter
-        else:
-            # Fallback: save as draft with error info
-            error_msg = portal_result.get("error", "unknown error")
-            write_foia_request(service, foia_sheet_id, {
-                "Request ID": generate_request_id(),
-                "Article URL": article["url"],
-                "Suspect Name": article["suspect_name"],
-                "Incident Date": article["incident_date"],
-                "Police Department": dept_name,
-                "State": state,
-                "FOIA Score": str(article.get("foia_score", "")),
-                "Request Method": "portal",
-                "Contact Info": portal_url,
-                "Status": "Portal Needed",
+                "Request Method": "email (unverified)",
+                "Contact Info": guessed_email,
+                "Status": "Draft",
                 "Date Created": today,
                 "Date Sent": "",
                 "Last Follow-Up": "",
                 "Follow-Up Count": "0",
-                "Notes": f"Awaiting OpenClaw portal submission. URL: {portal_url}. Error: {error_msg}",
+                "Notes": f"UNVERIFIED — guessed email, needs manual review before sending",
                 "Request Body": letter["body"],
             })
-            result["status"] = "portal_draft"
-            result["details"] = f"Portal auto-submit failed ({error_msg}), saved as draft. URL: {portal_url}"
-            result["method"] = "portal"
-            result["portal_url"] = portal_url
+            result["status"] = "draft"
+            result["details"] = f"Draft saved — guessed email: {guessed_email} (needs verification)"
+            result["method"] = "email"
             result["letter"] = letter
-    else:
-        # Last resort: try common email patterns for the department
-        guessed_email = _guess_pd_email(dept_name, state)
-        if guessed_email and foia_email and foia_email_password:
-            send_result = send_email_smtp(
-                smtp_host="smtp.gmail.com",
-                smtp_port=587,
-                email=foia_email,
-                password=foia_email_password,
-                to_addr=guessed_email,
-                subject=letter["subject"],
-                body=letter["body"],
-            )
-            if send_result["success"]:
-                from sheets_client import write_foia_request
-                write_foia_request(service, foia_sheet_id, {
-                    "Request ID": generate_request_id(),
-                    "Article URL": article["url"],
-                    "Suspect Name": article["suspect_name"],
-                    "Incident Date": article["incident_date"],
-                    "Police Department": dept_name,
-                    "State": state,
-                    "FOIA Score": str(article.get("foia_score", "")),
-                    "Request Method": "email (guessed)",
-                    "Contact Info": guessed_email,
-                    "Status": "Sent",
-                    "Date Created": today,
-                    "Date Sent": today,
-                    "Last Follow-Up": "",
-                    "Follow-Up Count": "0",
-                    "Notes": f"Sent to guessed email — verify delivery",
-                    "Request Body": letter["body"],
-                })
-                result["status"] = "sent"
-                result["details"] = f"Sent to guessed email: {guessed_email} (verify delivery)"
-                result["method"] = "email"
-                result["letter"] = letter
-                time.sleep(1)
-            else:
-                # Save as draft even with no contact
-                from sheets_client import write_foia_request
-                write_foia_request(service, foia_sheet_id, {
-                    "Request ID": generate_request_id(),
-                    "Article URL": article["url"],
-                    "Suspect Name": article["suspect_name"],
-                    "Incident Date": article["incident_date"],
-                    "Police Department": dept_name,
-                    "State": state,
-                    "FOIA Score": str(article.get("foia_score", "")),
-                    "Request Method": "unknown",
-                    "Contact Info": "",
-                    "Status": "Draft",
-                    "Date Created": today,
-                    "Date Sent": "",
-                    "Last Follow-Up": "",
-                    "Follow-Up Count": "0",
-                    "Notes": f"No contact found. Guessed email {guessed_email} failed: {send_result['error']}",
-                    "Request Body": letter["body"],
-                })
-                result["status"] = "portal_draft"
-                result["details"] = f"No contact found for {dept_name}. Saved as draft."
         else:
             from sheets_client import write_foia_request
             write_foia_request(service, foia_sheet_id, {
@@ -1052,7 +970,7 @@ def process_single_request(
                 "Notes": "No contact info found — needs manual lookup",
                 "Request Body": letter["body"],
             })
-            result["status"] = "portal_draft"
+            result["status"] = "draft"
             result["details"] = f"No contact found for {dept_name}. Saved as draft."
 
     return result
