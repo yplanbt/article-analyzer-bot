@@ -423,6 +423,48 @@ def run():
         portal_type = detect_portal_type(portal_url)
         print(f"  Type: {portal_type}")
 
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # 3a2. JustFOIA email-first: skip portal if we have a department email
+        if portal_type == "justfoia":
+            dept_email = _lookup_dept_email(client, dept, portal_url)
+            if dept_email:
+                foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
+                foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
+                if foia_password:
+                    print(f"  JustFOIA portal — sending via email instead: {dept_email}")
+                    try:
+                        import smtplib
+                        import ssl
+                        from email.mime.text import MIMEText
+                        from email.mime.multipart import MIMEMultipart
+
+                        msg = MIMEMultipart()
+                        msg["From"] = foia_email
+                        msg["To"] = dept_email
+                        msg["Subject"] = subject
+                        msg.attach(MIMEText(body, "plain"))
+
+                        ctx = ssl.create_default_context()
+                        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                            server.starttls(context=ctx)
+                            server.login(foia_email, foia_password)
+                            server.sendmail(foia_email, dept_email, msg.as_string())
+
+                        update_request_status(worksheet, row_idx,
+                                              status="Sent",
+                                              notes=f"JustFOIA blocked — sent via email to {dept_email}",
+                                              date_sent=today)
+                        log_to_activity(client, "Email Sent (JustFOIA fallback)",
+                                        f"{dept} — {suspect}: emailed {dept_email}")
+                        print(f"  EMAIL SUCCESS: Sent to {dept_email}")
+                        submitted += 1
+                        if item != pending[-1]:
+                            time.sleep(5)
+                        continue
+                    except Exception as email_err:
+                        print(f"  Email send failed: {email_err}, will try portal...")
+
         # 3b. Look up saved portal credentials
         saved_creds = lookup_portal_credentials(client, portal_url)
         if saved_creds:
@@ -501,14 +543,18 @@ def run():
                              "chromium", "browser", "errno"]
             is_system_error = any(kw in error.lower() for kw in SYSTEM_ERRORS)
 
-            if is_system_error:
+            if is_system_error and portal_type != "justfoia":
+                # Non-JustFOIA system errors: retry next run
                 update_request_status(worksheet, row_idx,
                                       status="Portal Needed",
                                       notes=f"System error (will retry): {error[:150]}")
                 log_to_activity(client, "Portal System Error",
                                 f"{dept} — {suspect}: {error[:100]}")
                 print(f"  SYSTEM ERROR (will retry next run): {error}")
-            elif result.get("needs_registration") or "access restricted" in error.lower():
+            elif (result.get("needs_registration")
+                  or "access restricted" in error.lower()
+                  or "unable to connect" in error.lower()
+                  or portal_type == "justfoia"):
                 # Portal is locked — try sending via email as fallback
                 # Look up department email from PD Database
                 dept_email = _lookup_dept_email(client, dept, portal_url)
