@@ -286,55 +286,83 @@ def _submit_nextrequest(page, url, body, subject, name, email, creds):
         return {"success": False, "error": f"NextRequest error: {str(e)}", "portal_type": "nextrequest"}
 
 
-def _submit_justfoia(page, url, body, subject, name, email, creds):
-    """Submit through JustFOIA portal.
+def _justfoia_base_url(url):
+    """Extract JustFOIA base URL (e.g., https://rochesterny.justfoia.com)."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.hostname}"
 
-    JustFOIA portals follow pattern: *.justfoia.com/publicportal
-    The new request form is at /publicportal/home/newrequest
-    Fields: Request Description (textarea), First Name, Last Name, Email, Phone, Address
+
+def _justfoia_login(page, base_url, username, password):
+    """Log into a JustFOIA portal. Returns True if login succeeded."""
+    login_url = base_url + "/publicportal/home/login"
+    page.goto(login_url, wait_until="networkidle")
+    time.sleep(2)
+
+    # Fill email/username
+    for selector in ["input[type='email']", "input[name*='email' i]", "input[id*='email' i]",
+                      "input[name*='user' i]", "#Email", "#username"]:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.fill(username)
+                break
+        except Exception:
+            continue
+
+    # Fill password
+    for selector in ["input[type='password']", "input[name*='pass' i]", "#Password"]:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.fill(password)
+                break
+        except Exception:
+            continue
+
+    # Click login
+    for selector in ["button[type='submit']", "button:has-text('Log')", "button:has-text('Sign')",
+                      "input[type='submit']", "a:has-text('Log In')"]:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.click()
+                time.sleep(3)
+                break
+        except Exception:
+            continue
+
+    # Check if login succeeded (should redirect away from login page)
+    return "login" not in page.url.lower() and "restricted" not in page.title().lower()
+
+
+def _register_justfoia(page, base_url, name, email):
+    """Auto-register on a JustFOIA portal.
+
+    Returns {"success": True, "password": "..."} or {"success": False, "error": "..."}.
     """
-    # Navigate directly to the new request form
-    if "/newrequest" not in url.lower():
-        base = url.rstrip("/")
-        if "/publicportal" in base:
-            new_request_url = base.rsplit("/publicportal", 1)[0] + "/publicportal/home/newrequest"
-        else:
-            new_request_url = base + "/publicportal/home/newrequest"
-    else:
-        new_request_url = url
+    import hashlib
+    # Generate deterministic password from portal domain
+    domain = base_url.replace("https://", "").replace("http://", "")
+    password = "Foia" + hashlib.md5(domain.encode()).hexdigest()[:8] + "!1"
 
-    page.goto(new_request_url, wait_until="networkidle")
+    register_url = base_url + "/publicportal/home/register"
+    page.goto(register_url, wait_until="networkidle")
     time.sleep(3)
 
     try:
-        # JustFOIA uses specific field patterns
-        # Request Description — main textarea
-        for selector in [
-            "textarea[id*='description' i]", "textarea[id*='request' i]",
-            "textarea[name*='description' i]", "textarea[name*='request' i]",
-            "textarea[placeholder*='description' i]", "textarea[placeholder*='request' i]",
-            "textarea",
-        ]:
-            try:
-                el = page.locator(selector)
-                if el.count() > 0 and el.first.is_visible():
-                    el.first.fill(body)
-                    break
-            except Exception:
-                continue
+        # Check if registration page loaded
+        title = page.title().lower()
+        if "restricted" in title or "error" in title:
+            return {"success": False, "error": "Registration page not accessible"}
 
-        # Also try label-based filling
-        _fill_by_labels(page, body, subject, name, email)
-
-        # First Name / Last Name (JustFOIA splits name)
         name_parts = name.strip().split(" ", 1)
         first_name = name_parts[0]
-        last_name = name_parts[1] if len(name_parts) > 1 else ""
+        last_name = name_parts[1] if len(name_parts) > 1 else first_name
 
-        for selector in [
-            "input[id*='first' i]", "input[name*='first' i]",
-            "input[placeholder*='first' i]",
-        ]:
+        # Fill First Name
+        for selector in ["input[id*='first' i]", "input[name*='first' i]",
+                          "input[placeholder*='first' i]"]:
             try:
                 el = page.locator(selector)
                 if el.count() > 0 and el.first.is_visible():
@@ -343,10 +371,9 @@ def _submit_justfoia(page, url, body, subject, name, email, creds):
             except Exception:
                 continue
 
-        for selector in [
-            "input[id*='last' i]", "input[name*='last' i]",
-            "input[placeholder*='last' i]",
-        ]:
+        # Fill Last Name
+        for selector in ["input[id*='last' i]", "input[name*='last' i]",
+                          "input[placeholder*='last' i]"]:
             try:
                 el = page.locator(selector)
                 if el.count() > 0 and el.first.is_visible():
@@ -355,11 +382,9 @@ def _submit_justfoia(page, url, body, subject, name, email, creds):
             except Exception:
                 continue
 
-        # Email
-        for selector in [
-            "input[type='email']", "input[id*='email' i]",
-            "input[name*='email' i]", "input[placeholder*='email' i]",
-        ]:
+        # Fill Email
+        for selector in ["input[type='email']", "input[id*='email' i]",
+                          "input[name*='email' i]"]:
             try:
                 el = page.locator(selector)
                 if el.count() > 0 and el.first.is_visible():
@@ -368,11 +393,239 @@ def _submit_justfoia(page, url, body, subject, name, email, creds):
             except Exception:
                 continue
 
-        # Phone (optional but often required)
+        # Fill Password + Confirm Password
+        password_fields = page.locator("input[type='password']")
+        pw_count = password_fields.count()
+        if pw_count >= 1:
+            password_fields.nth(0).fill(password)
+        if pw_count >= 2:
+            password_fields.nth(1).fill(password)
+
+        # Fill phone if present
         _fill_phone_field(page, "000-000-0000")
 
-        # Check required boxes
+        # Check any required boxes (terms, etc.)
         _check_required_boxes(page)
+
+        # Click register/submit
+        for selector in ["button[type='submit']", "button:has-text('Register')",
+                          "button:has-text('Sign Up')", "button:has-text('Create')",
+                          "input[type='submit']", "button:has-text('Submit')"]:
+            try:
+                el = page.locator(selector)
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.click()
+                    time.sleep(3)
+                    break
+            except Exception:
+                continue
+
+        # Check result
+        page_text = page.content().lower()
+        if any(kw in page_text for kw in ["verification", "confirm your email",
+                                            "check your email", "sent you an email",
+                                            "registered", "account created"]):
+            print("  Registration submitted — verification email expected")
+            return {"success": True, "password": password, "needs_verification": True}
+        elif any(kw in page_text for kw in ["already registered", "already exists",
+                                              "account exists"]):
+            print("  Account already exists — trying login instead")
+            return {"success": True, "password": password, "already_exists": True}
+        else:
+            _save_debug_screenshot(page, "justfoia_register")
+            return {"success": False, "error": "Registration outcome unclear",
+                    "password": password}
+
+    except Exception as e:
+        _save_debug_screenshot(page, "justfoia_register")
+        return {"success": False, "error": f"Registration error: {str(e)}"}
+
+
+def _check_verification_email(email_addr, email_password, sender_pattern="justfoia", timeout=90):
+    """Check Gmail IMAP for a JustFOIA verification email and extract the link.
+
+    Returns the verification URL or None.
+    """
+    import imaplib
+    import email as email_lib
+    from email.header import decode_header
+
+    print(f"  Checking email for verification link (timeout {timeout}s)...")
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail.login(email_addr, email_password)
+            mail.select("INBOX")
+
+            # Search for recent emails from JustFOIA
+            _, messages = mail.search(None, f'(UNSEEN FROM "{sender_pattern}")')
+            msg_nums = messages[0].split()
+
+            for num in reversed(msg_nums):  # Most recent first
+                _, msg_data = mail.fetch(num, "(RFC822)")
+                msg = email_lib.message_from_bytes(msg_data[0][1])
+
+                # Check subject for verification keywords
+                subject = str(decode_header(msg["Subject"])[0][0] or "")
+                if isinstance(subject, bytes):
+                    subject = subject.decode("utf-8", errors="ignore")
+
+                if not any(kw in subject.lower() for kw in
+                           ["verif", "confirm", "activate", "welcome", "registration"]):
+                    continue
+
+                # Extract verification link from email body
+                body_text = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ctype = part.get_content_type()
+                        if ctype in ("text/plain", "text/html"):
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body_text += payload.decode("utf-8", errors="ignore")
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body_text = payload.decode("utf-8", errors="ignore")
+
+                # Find verification link
+                import re as _re
+                links = _re.findall(r'https?://[^\s<>"\']+(?:verif|confirm|activate|token)[^\s<>"\']*',
+                                     body_text, _re.IGNORECASE)
+                if links:
+                    mail.logout()
+                    print(f"  Found verification link")
+                    return links[0]
+
+                # Fallback: any link from justfoia domain
+                links = _re.findall(r'https?://[^\s<>"\']*justfoia[^\s<>"\']*', body_text, _re.IGNORECASE)
+                if links:
+                    # Filter out obvious non-verification links
+                    for link in links:
+                        if any(kw in link.lower() for kw in ["verif", "confirm", "activate", "token", "click"]):
+                            mail.logout()
+                            print(f"  Found verification link")
+                            return link
+
+            mail.logout()
+        except Exception as e:
+            print(f"  IMAP check error: {e}")
+
+        # Wait before checking again
+        if time.time() < deadline:
+            time.sleep(10)
+
+    print("  No verification email found within timeout")
+    return None
+
+
+def _submit_justfoia(page, url, body, subject, name, email, creds):
+    """Submit through JustFOIA portal with auto-registration.
+
+    Flow:
+    1. If credentials exist → login → submit
+    2. If no credentials → register → verify email → login → submit
+    3. If registration fails → return needs_registration for manual handling
+    """
+    base_url = _justfoia_base_url(url)
+
+    # Build new request URL
+    if "/newrequest" not in url.lower():
+        if "/publicportal" in url:
+            new_request_url = url.rsplit("/publicportal", 1)[0] + "/publicportal/home/newrequest"
+        else:
+            new_request_url = base_url + "/publicportal/home/newrequest"
+    else:
+        new_request_url = url
+
+    try:
+        logged_in = False
+        new_credentials = None
+
+        # Step 1: Try login with existing credentials
+        if creds and creds.get("password"):
+            cred_user = creds.get("email") or creds.get("username", email)
+            cred_pass = creds["password"]
+            print(f"  Logging in with saved credentials...")
+            logged_in = _justfoia_login(page, base_url, cred_user, cred_pass)
+            if logged_in:
+                print(f"  Login successful")
+
+        # Step 2: No credentials or login failed → auto-register
+        if not logged_in:
+            print(f"  No valid credentials — attempting auto-registration...")
+            reg_result = _register_justfoia(page, base_url, name, email)
+
+            if reg_result.get("success"):
+                reg_password = reg_result["password"]
+
+                # Check for email verification if needed
+                if reg_result.get("needs_verification"):
+                    email_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
+                    if email_password:
+                        verify_link = _check_verification_email(email, email_password)
+                        if verify_link:
+                            print(f"  Clicking verification link...")
+                            page.goto(verify_link, wait_until="networkidle")
+                            time.sleep(3)
+                        else:
+                            return {
+                                "success": False,
+                                "error": "Registration submitted but verification email not received",
+                                "portal_type": "justfoia",
+                                "needs_registration": True,
+                            }
+                    else:
+                        return {
+                            "success": False,
+                            "error": "Registration needs email verification but FOIA_EMAIL_PASSWORD not set",
+                            "portal_type": "justfoia",
+                            "needs_registration": True,
+                        }
+
+                # Try logging in with new credentials
+                print(f"  Logging in with new credentials...")
+                logged_in = _justfoia_login(page, base_url, email, reg_password)
+                if logged_in:
+                    print(f"  Login successful after registration")
+                    new_credentials = {"username": email, "password": reg_password}
+            else:
+                _save_debug_screenshot(page, "justfoia_reg_fail")
+                return {
+                    "success": False,
+                    "error": f"Registration failed: {reg_result.get('error', 'unknown')}",
+                    "portal_type": "justfoia",
+                    "needs_registration": True,
+                }
+
+        if not logged_in:
+            _save_debug_screenshot(page, "justfoia_login_fail")
+            return {
+                "success": False,
+                "error": "Could not log into JustFOIA portal",
+                "portal_type": "justfoia",
+                "needs_registration": True,
+            }
+
+        # Step 3: Navigate to new request form and fill it
+        page.goto(new_request_url, wait_until="networkidle")
+        time.sleep(3)
+
+        # Check if we actually reached the form (not redirected to access restricted)
+        title = page.title().lower()
+        if "restricted" in title:
+            _save_debug_screenshot(page, "justfoia_restricted")
+            return {
+                "success": False,
+                "error": "Still access restricted after login",
+                "portal_type": "justfoia",
+                "needs_registration": True,
+            }
+
+        # Fill form fields
+        _fill_justfoia_form(page, body, subject, name, email)
 
         # Submit
         submitted = _click_submit(page)
@@ -380,25 +633,89 @@ def _submit_justfoia(page, url, body, subject, name, email, creds):
         if submitted:
             time.sleep(3)
             conf = _extract_confirmation(page)
-            return {
+            result = {
                 "success": True,
                 "message": "Submitted via JustFOIA",
                 "confirmation": conf,
                 "portal_type": "justfoia",
             }
+            if new_credentials:
+                result["new_credentials"] = new_credentials
+            return result
         else:
-            _save_debug_screenshot(page, "justfoia")
+            _save_debug_screenshot(page, "justfoia_submit")
             return {
                 "success": False,
-                "error": "Could not complete JustFOIA submission — no submit button found",
+                "error": "Could not find submit button on JustFOIA form",
                 "portal_type": "justfoia",
                 "needs_manual": True,
                 "page_url": page.url,
             }
 
     except Exception as e:
-        _save_debug_screenshot(page, "justfoia")
+        _save_debug_screenshot(page, "justfoia_error")
         return {"success": False, "error": f"JustFOIA error: {str(e)}", "portal_type": "justfoia"}
+
+
+def _fill_justfoia_form(page, body, subject, name, email):
+    """Fill the JustFOIA new request form fields."""
+    # Request Description — main textarea
+    for selector in [
+        "textarea[id*='description' i]", "textarea[id*='request' i]",
+        "textarea[name*='description' i]", "textarea[name*='request' i]",
+        "textarea[placeholder*='description' i]", "textarea[placeholder*='request' i]",
+        "textarea",
+    ]:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.fill(body)
+                break
+        except Exception:
+            continue
+
+    # Label-based filling
+    _fill_by_labels(page, body, subject, name, email)
+
+    # First Name / Last Name (JustFOIA splits name)
+    name_parts = name.strip().split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+    for selector in ["input[id*='first' i]", "input[name*='first' i]", "input[placeholder*='first' i]"]:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.fill(first_name)
+                break
+        except Exception:
+            continue
+
+    for selector in ["input[id*='last' i]", "input[name*='last' i]", "input[placeholder*='last' i]"]:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.fill(last_name)
+                break
+        except Exception:
+            continue
+
+    # Email (may be pre-filled if logged in, but fill anyway)
+    for selector in ["input[type='email']", "input[id*='email' i]",
+                      "input[name*='email' i]", "input[placeholder*='email' i]"]:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.fill(email)
+                break
+        except Exception:
+            continue
+
+    # Phone (optional but often required)
+    _fill_phone_field(page, "000-000-0000")
+
+    # Check required boxes
+    _check_required_boxes(page)
 
 
 def _submit_formcenter(page, url, body, subject, name, email, creds):

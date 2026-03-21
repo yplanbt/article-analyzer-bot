@@ -113,6 +113,102 @@ def _get_col_indices(worksheet):
     return _HEADER_CACHE[ws_id]
 
 
+# ── Portal credential helpers ────────────────────────────────────────────────
+
+_CRED_CACHE = None  # type: Optional[List[Dict]]
+
+
+def _get_pd_database(client):
+    # type: (gspread.Client) -> List[Dict]
+    """Read PD Database tab via gspread. Caches result for the run."""
+    global _CRED_CACHE
+    if _CRED_CACHE is not None:
+        return _CRED_CACHE
+    try:
+        sheet = client.open_by_key(SHEET_ID)
+        ws = sheet.worksheet("PD Database")
+        _CRED_CACHE = _retry_on_429(lambda: ws.get_all_records())
+        return _CRED_CACHE
+    except Exception:
+        _CRED_CACHE = []
+        return []
+
+
+def lookup_portal_credentials(client, portal_url):
+    # type: (gspread.Client, str) -> Optional[Dict]
+    """Look up saved credentials for a portal URL by matching domain."""
+    if not portal_url:
+        return None
+    try:
+        from urllib.parse import urlparse
+        query_domain = urlparse(portal_url.lower()).hostname or ""
+    except Exception:
+        return None
+
+    pd_db = _get_pd_database(client)
+    for entry in pd_db:
+        entry_url = str(entry.get("Portal URL", "")).lower().strip()
+        if not entry_url:
+            continue
+        try:
+            from urllib.parse import urlparse
+            entry_domain = urlparse(entry_url).hostname or ""
+        except Exception:
+            continue
+        if query_domain and entry_domain and query_domain == entry_domain:
+            username = str(entry.get("Portal Username", "")).strip()
+            password = str(entry.get("Portal Password", "")).strip()
+            if username and password:
+                return {"email": username, "password": password}
+    return None
+
+
+def save_portal_credentials(client, portal_url, dept_name, username, password):
+    # type: (gspread.Client, str, str, str, str) -> None
+    """Save portal credentials to PD Database tab."""
+    global _CRED_CACHE
+    try:
+        sheet = client.open_by_key(SHEET_ID)
+        try:
+            ws = sheet.worksheet("PD Database")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet("PD Database", rows=500, cols=11)
+            ws.update("A1:K1", [[
+                "Department Name", "State", "Method", "Email Address",
+                "Portal URL", "Portal Type", "Notes", "Last Used",
+                "Has CAPTCHA", "Portal Username", "Portal Password",
+            ]])
+
+        # Check if row exists for this portal domain
+        from urllib.parse import urlparse
+        query_domain = urlparse(portal_url.lower()).hostname or ""
+        all_rows = _retry_on_429(lambda: ws.get_all_records())
+
+        for i, row in enumerate(all_rows):
+            entry_url = str(row.get("Portal URL", "")).lower().strip()
+            try:
+                entry_domain = urlparse(entry_url).hostname or ""
+            except Exception:
+                continue
+            if query_domain and entry_domain and query_domain == entry_domain:
+                # Update existing row (columns J and K)
+                row_num = i + 2
+                _retry_on_429(lambda: ws.update(f"J{row_num}:K{row_num}", [[username, password]]))
+                print(f"  Saved credentials to PD Database row {row_num}")
+                _CRED_CACHE = None  # Invalidate cache
+                return
+
+        # Add new row
+        ws.append_row([
+            dept_name, "", "portal", "", portal_url, "justfoia",
+            "Auto-registered", "", "", username, password,
+        ])
+        print(f"  Saved new PD Database entry with credentials")
+        _CRED_CACHE = None
+    except Exception as e:
+        print(f"  Warning: Could not save credentials: {e}")
+
+
 # ── Google Sheets helpers ────────────────────────────────────────────────────
 
 def get_sheet_client():
@@ -288,10 +384,18 @@ def run():
         portal_type = detect_portal_type(portal_url)
         print(f"  Type: {portal_type}")
 
-        # 3b. Mark as "Submitting..."
+        # 3b. Look up saved portal credentials
+        saved_creds = lookup_portal_credentials(client, portal_url)
+        if saved_creds:
+            print(f"  Found saved credentials for this portal")
+            portal_creds = saved_creds
+        else:
+            portal_creds = {"email": REQUESTER_EMAIL, "password": ""}
+
+        # 3c. Mark as "Submitting..."
         update_request_status(worksheet, row_idx, status="Submitting...")
 
-        # 3c. Submit via hybrid approach (hardcoded flows + AI fallback) with retry
+        # 3d. Submit via hybrid approach (hardcoded flows + AI fallback) with retry
         MAX_ATTEMPTS = 2
         result = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -304,7 +408,7 @@ def run():
                     requester_name=REQUESTER_NAME,
                     requester_email=REQUESTER_EMAIL,
                     police_dept=dept,
-                    portal_credentials={"email": REQUESTER_EMAIL, "password": ""},
+                    portal_credentials=portal_creds,
                     anthropic_key=os.environ.get("ANTHROPIC_API_KEY", ""),
                     proxy=os.environ.get("US_PROXY", ""),
                 )
@@ -337,6 +441,14 @@ def run():
                             f"{dept} — {suspect}" + (f": {confirmation}" if confirmation else ""))
             print(f"  SUCCESS: {notes}")
             submitted += 1
+
+            # Save new portal credentials if registration happened
+            new_creds = result.get("new_credentials")
+            if new_creds:
+                save_portal_credentials(
+                    client, portal_url, dept,
+                    new_creds["username"], new_creds["password"]
+                )
         else:
             error = result.get("error", "Unknown error")[:200]
             steps = result.get("steps", [])
@@ -357,6 +469,14 @@ def run():
                 log_to_activity(client, "Portal System Error",
                                 f"{dept} — {suspect}: {error[:100]}")
                 print(f"  SYSTEM ERROR (will retry next run): {error}")
+            elif result.get("needs_registration"):
+                update_request_status(worksheet, row_idx,
+                                      status="Manual Needed",
+                                      notes=f"Portal requires manual account registration: {error[:150]}")
+                log_to_activity(client, "Portal Manual Needed",
+                                f"{dept} — {suspect}: needs manual registration")
+                print(f"  MANUAL NEEDED: Portal requires account registration")
+                failed += 1
             else:
                 update_request_status(worksheet, row_idx,
                                       status="Portal Failed",
