@@ -84,19 +84,57 @@ MAX_PER_RUN = int(os.environ.get("PORTAL_MAX_PER_RUN", "10"))
 
 # ── Rate-limit helpers ───────────────────────────────────────────────────────
 
-def _retry_on_429(fn, max_retries=3):
-    """Retry a gspread call with exponential backoff on 429."""
+def _retry_on_429(fn, max_retries=3, timeout=30):
+    """Retry a gspread call with exponential backoff on 429.
+
+    Args:
+        fn: Callable to retry
+        max_retries: Max retry attempts on 429
+        timeout: Max total seconds before giving up (prevents infinite hang)
+    """
+    import threading
+
+    deadline = time.time() + timeout
     for attempt in range(max_retries):
+        if time.time() > deadline:
+            raise TimeoutError(f"Sheets API call timed out after {timeout}s")
         try:
-            return fn()
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = 2 ** (attempt + 1)
-                print(f"  Rate limited, waiting {wait}s...")
-                time.sleep(wait)
+            # Run the actual call in a thread with timeout
+            result = [None]
+            error = [None]
+
+            def _call():
+                try:
+                    result[0] = fn()
+                except Exception as e:
+                    error[0] = e
+
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+            remaining = max(1, deadline - time.time())
+            t.join(timeout=min(remaining, 15))
+
+            if t.is_alive():
+                print(f"  Sheets API call hanging (attempt {attempt+1}), skipping...")
+                continue
+
+            if error[0]:
+                e = error[0]
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    wait = min(2 ** (attempt + 1), deadline - time.time())
+                    if wait > 0:
+                        print(f"  Rate limited, waiting {int(wait)}s...")
+                        time.sleep(wait)
+                else:
+                    raise e
             else:
-                raise
-    return fn()
+                return result[0]
+        except TimeoutError:
+            raise
+        except Exception:
+            raise
+
+    raise TimeoutError(f"Sheets API call failed after {max_retries} retries")
 
 
 # Header column cache (avoids re-reading row 1 on every update)
@@ -399,7 +437,12 @@ def run():
     write_openclaw_heartbeat(client, "Running", "Starting portal scan")
 
     # 2. Find all "Portal Needed" rows
-    pending, worksheet = get_pending_requests(client)
+    try:
+        pending, worksheet = get_pending_requests(client)
+    except (TimeoutError, Exception) as e:
+        print(f"ERROR: Could not read pending requests: {e}")
+        print("This usually means Google Sheets API is rate-limited. Wait 1-2 min and retry.")
+        return
 
     if not pending:
         print("No pending portal requests found.")
