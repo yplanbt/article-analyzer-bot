@@ -260,39 +260,57 @@ def update_request_status(worksheet, row_index, status, notes="", date_sent=""):
 # ── Activity logging & heartbeat ─────────────────────────────────────────────
 
 def log_to_activity(client, action, details):
-    """Write an entry to the Activity Log tab."""
-    try:
-        sheet = client.open_by_key(SHEET_ID)
+    """Write an entry to the Activity Log tab. Non-blocking with timeout."""
+    import threading
+
+    def _write():
         try:
-            ws = sheet.worksheet("Activity Log")
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sheet.add_worksheet("Activity Log", rows=1000, cols=4)
-            ws.update('A1:D1', [["Timestamp", "Action", "Details", "Source"]])
-        ws.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            action, details, "OpenClaw"
-        ])
-    except Exception as e:
-        print(f"Warning: Could not log activity: {e}")
+            sheet = client.open_by_key(SHEET_ID)
+            try:
+                ws = sheet.worksheet("Activity Log")
+            except gspread.exceptions.WorksheetNotFound:
+                ws = sheet.add_worksheet("Activity Log", rows=1000, cols=4)
+                ws.update('A1:D1', [["Timestamp", "Action", "Details", "Source"]])
+            ws.append_row([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                action, details, "OpenClaw"
+            ])
+        except Exception as e:
+            print(f"Warning: Could not log activity: {e}")
+
+    t = threading.Thread(target=_write, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    if t.is_alive():
+        print("Warning: Activity log write timed out after 10s, continuing...")
 
 
 def write_openclaw_heartbeat(client, status, last_action=""):
-    """Write OpenClaw heartbeat to Monitor tab row 3."""
-    try:
-        sheet = client.open_by_key(SHEET_ID)
+    """Write OpenClaw heartbeat to Monitor tab row 3. Non-blocking with timeout."""
+    import threading
+
+    def _write():
         try:
-            ws = sheet.worksheet("Monitor")
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sheet.add_worksheet("Monitor", rows=10, cols=8)
-            ws.update('A1:H1', [["Timestamp", "Status", "Last Action",
-                                  "Articles Queued", "FOIA Queued",
-                                  "Portal Queued", "Errors", "Kevin Trigger"]])
-        ws.update('A3:G3', [[
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            status, last_action, "", "", "", ""
-        ]])
-    except Exception as e:
-        print(f"Warning: Could not write heartbeat: {e}")
+            sheet = client.open_by_key(SHEET_ID)
+            try:
+                ws = sheet.worksheet("Monitor")
+            except gspread.exceptions.WorksheetNotFound:
+                ws = sheet.add_worksheet("Monitor", rows=10, cols=8)
+                ws.update('A1:H1', [["Timestamp", "Status", "Last Action",
+                                      "Articles Queued", "FOIA Queued",
+                                      "Portal Queued", "Errors", "Kevin Trigger"]])
+            ws.update('A3:G3', [[
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                status, last_action, "", "", "", ""
+            ]])
+        except Exception as e:
+            print(f"Warning: Could not write heartbeat: {e}")
+
+    t = threading.Thread(target=_write, daemon=True)
+    t.start()
+    t.join(timeout=10)  # Wait max 10 seconds, then move on
+    if t.is_alive():
+        print("Warning: Heartbeat write timed out after 10s, continuing...")
 
 
 def clear_kevin_trigger(client):
