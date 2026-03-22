@@ -262,9 +262,13 @@ def get_sheet_client():
 def get_pending_requests(client):
     # type: (gspread.Client) -> Tuple[List[Dict], gspread.Worksheet]
     """Get all rows with Status = 'Portal Needed' from the Requests tab."""
+    print("  Opening sheet...", flush=True)
     sheet = client.open_by_key(SHEET_ID)
+    print("  Getting Requests worksheet...", flush=True)
     worksheet = sheet.worksheet("Requests")
+    print("  Reading all rows...", flush=True)
     all_rows = _retry_on_429(lambda: worksheet.get_all_records())
+    print(f"  Read {len(all_rows)} rows, filtering...", flush=True)
 
     pending = []
     for i, row in enumerate(all_rows):
@@ -424,39 +428,40 @@ def _lookup_dept_email(client, dept_name, portal_url):
 
 def run():
     """Main skill entry point. Called by OpenClaw on manual trigger."""
-    print("FOIA Portal Skill: Starting...")
+    print("FOIA Portal Skill: Starting...", flush=True)
 
     # 1. Connect to Google Sheets
     try:
+        print("[1/3] Connecting to Google Sheets...", flush=True)
         client = get_sheet_client()
-        print("Google Sheets: Connected")
+        print("[1/3] Google Sheets: Connected", flush=True)
     except Exception as e:
-        print(f"ERROR: Cannot connect to Google Sheets: {e}")
+        print(f"ERROR: Cannot connect to Google Sheets: {e}", flush=True)
         return
 
-    write_openclaw_heartbeat(client, "Running", "Starting portal scan")
+    # Skip heartbeat on startup — it causes rate limit issues
+    print("[2/3] Fetching pending portal requests...", flush=True)
 
     # 2. Find all "Portal Needed" rows
     try:
         pending, worksheet = get_pending_requests(client)
     except (TimeoutError, Exception) as e:
-        print(f"ERROR: Could not read pending requests: {e}")
-        print("This usually means Google Sheets API is rate-limited. Wait 1-2 min and retry.")
+        print(f"ERROR: Could not read pending requests: {e}", flush=True)
+        print("This usually means Google Sheets API is rate-limited. Wait 1-2 min and retry.", flush=True)
         return
 
     if not pending:
-        print("No pending portal requests found.")
-        write_openclaw_heartbeat(client, "Idle", "No pending requests")
+        print("[2/3] No pending portal requests found.", flush=True)
         return
 
     # Limit per run to avoid very long executions
     if len(pending) > MAX_PER_RUN:
-        print(f"Found {len(pending)} requests, processing first {MAX_PER_RUN}.")
+        print(f"[2/3] Found {len(pending)} requests, processing first {MAX_PER_RUN}.", flush=True)
         pending = pending[:MAX_PER_RUN]
     else:
-        print(f"Found {len(pending)} portal request(s) to process.")
+        print(f"[2/3] Found {len(pending)} portal request(s) to process.", flush=True)
 
-    log_to_activity(client, "Portal Scan", f"Processing {len(pending)} request(s)")
+    print("[3/3] Starting row processing...", flush=True)
 
     submitted = 0
     failed = 0
