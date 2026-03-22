@@ -58,6 +58,10 @@ except ImportError:
         sys.exit(1)
 
 
+# Use cheap model for DOM-based AI form filler (Tier 2)
+if "BROWSER_USE_MODEL" not in os.environ:
+    os.environ["BROWSER_USE_MODEL"] = "gpt-4o-mini"
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 SKILL_DIR = Path(__file__).parent

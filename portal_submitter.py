@@ -120,9 +120,26 @@ def submit_to_portal(
                 result = _submit_generic(page, portal_url, request_body, subject,
                                           requester_name, requester_email)
 
+            # Tier 2: If generic filler failed, try DOM-based AI filler (cheap)
+            if not result.get("success") and result.get("portal_type") == "unknown":
+                openai_key = os.environ.get("OPENAI_API_KEY", "")
+                if openai_key:
+                    print(f"  Trying DOM-based AI filler (GPT-4o-mini)...")
+                    try:
+                        ai_dom_result = _ai_fill_form_dom(
+                            page, request_body, subject, requester_name,
+                            requester_email, police_dept, openai_key
+                        )
+                        if ai_dom_result.get("success"):
+                            browser.close()
+                            return ai_dom_result
+                        print(f"  DOM AI filler: {ai_dom_result.get('error', 'failed')}")
+                    except Exception as e:
+                        print(f"  DOM AI filler error: {e}")
+
             browser.close()
 
-            # If Playwright failed and AI fallback is enabled, try AI agent
+            # Tier 3: If still failed and AI vision fallback is enabled (expensive)
             if not result.get("success") and use_ai_fallback and anthropic_key:
                 ai_result = _try_ai_agent(
                     portal_url, request_body, subject, requester_name,
@@ -858,6 +875,172 @@ def _submit_generic(page, url, body, subject, name, email):
     except Exception as e:
         _save_debug_screenshot(page, "generic")
         return {"success": False, "error": f"Generic portal error: {str(e)}", "portal_type": "unknown"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tier 2: DOM-based AI form filler (cheap, uses GPT-4o-mini text-only)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ai_fill_form_dom(page, body, subject, name, email, police_dept, openai_key):
+    """Use GPT-4o-mini with DOM extraction to fill unknown portal forms.
+
+    Instead of expensive screenshots, extracts form structure as text and asks
+    a cheap LLM to map fields to values. ~$0.01 per submission vs $0.50+ for vision.
+    """
+    import json as _json
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return {"success": False, "error": "OpenAI package not installed"}
+
+    client = OpenAI(api_key=openai_key)
+    model = os.environ.get("BROWSER_USE_MODEL", "gpt-4o-mini")
+
+    # Step 1: Extract all visible form elements from the page
+    form_elements = page.evaluate("""() => {
+        const els = document.querySelectorAll('input, textarea, select, button[type="submit"], input[type="submit"]');
+        return Array.from(els).map(el => {
+            const rect = el.getBoundingClientRect();
+            const labelEl = el.labels && el.labels[0] ? el.labels[0] : null;
+            let labelText = '';
+            if (labelEl) {
+                labelText = labelEl.textContent.trim();
+            } else if (el.id) {
+                const forLabel = document.querySelector('label[for="' + el.id + '"]');
+                if (forLabel) labelText = forLabel.textContent.trim();
+            }
+            if (!labelText && el.getAttribute('aria-label')) {
+                labelText = el.getAttribute('aria-label');
+            }
+            return {
+                tag: el.tagName.toLowerCase(),
+                type: el.type || '',
+                name: el.name || '',
+                id: el.id || '',
+                placeholder: el.placeholder || '',
+                label: labelText,
+                required: el.required || false,
+                visible: rect.width > 0 && rect.height > 0,
+                value: el.value || '',
+                options: el.tagName === 'SELECT' ?
+                    Array.from(el.options).map(o => ({value: o.value, text: o.text})) : []
+            };
+        }).filter(e => e.visible);
+    }""")
+
+    if not form_elements or len(form_elements) < 2:
+        return {"success": False, "error": "No visible form elements found on page"}
+
+    # Step 2: Get page title and URL for context
+    page_title = page.title()
+    page_url = page.url
+
+    # Step 3: Ask GPT-4o-mini to map fields to values (TEXT ONLY — no vision)
+    prompt = f"""You are filling out a government public records request form.
+
+Page: {page_title} ({page_url})
+Department: {police_dept}
+
+Form fields found on page:
+{_json.dumps(form_elements, indent=2)}
+
+Values to fill:
+- Requester Name: {name}
+- Requester Email: {email}
+- Subject: {subject}
+- Request Description: {body[:1500]}
+- Phone (if required): 000-000-0000
+- Address (if required): 123 Main St, New York, NY 10001
+
+Return a JSON array of actions to fill the form. Each action should be:
+{{"selector": "#id or [name=value]", "value": "text to fill", "action": "fill"}}
+
+For select dropdowns, use:
+{{"selector": "#id", "value": "option value", "action": "select"}}
+
+For checkboxes that need checking:
+{{"selector": "#id", "value": "true", "action": "check"}}
+
+Rules:
+- Use the most specific selector: prefer #id, then [name=x], then [placeholder=x]
+- For name fields: if there's first/last split, split the name appropriately
+- For the main text/description field: use the full request body
+- Skip hidden fields and submit buttons
+- Return ONLY the JSON array, no other text"""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800,
+            temperature=0,
+        )
+        raw = response.choices[0].message.content.strip()
+
+        # Parse JSON from response
+        json_match = re.search(r'\[[\s\S]*\]', raw)
+        if not json_match:
+            return {"success": False, "error": "AI returned unparseable response"}
+
+        actions = _json.loads(json_match.group())
+    except Exception as e:
+        return {"success": False, "error": f"AI API call failed: {str(e)[:200]}"}
+
+    # Step 4: Execute each action
+    filled_count = 0
+    for action in actions:
+        selector = action.get("selector", "")
+        value = action.get("value", "")
+        act_type = action.get("action", "fill")
+
+        if not selector or not value:
+            continue
+
+        try:
+            el = page.locator(selector).first
+            if not el.is_visible():
+                continue
+
+            if act_type == "select":
+                el.select_option(value=value)
+                filled_count += 1
+            elif act_type == "check":
+                if not el.is_checked():
+                    el.check()
+                filled_count += 1
+            else:  # fill
+                el.click()
+                el.fill(value)
+                filled_count += 1
+            print(f"    Filled {selector}: {value[:50]}...")
+        except Exception as e:
+            print(f"    Could not fill {selector}: {e}")
+
+    if filled_count == 0:
+        return {"success": False, "error": "AI mapped fields but none could be filled"}
+
+    print(f"  DOM AI filled {filled_count} fields, clicking submit...")
+
+    # Step 5: Click submit
+    submitted = _click_submit(page)
+
+    if submitted:
+        time.sleep(3)
+        conf = _extract_confirmation(page)
+        return {
+            "success": True,
+            "message": f"Submitted via DOM AI filler ({model}, {filled_count} fields)",
+            "confirmation": conf,
+            "portal_type": "ai_dom",
+        }
+
+    _save_debug_screenshot(page, "ai_dom")
+    return {
+        "success": False,
+        "error": f"DOM AI filled {filled_count} fields but submit button not found",
+        "portal_type": "ai_dom",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
