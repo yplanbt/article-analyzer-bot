@@ -425,6 +425,42 @@ def _lookup_dept_email(client, dept_name, portal_url):
         if dept_lower and entry_dept and (dept_lower in entry_dept or entry_dept in dept_lower):
             return email
 
+    # Last resort: try common .gov email patterns via DNS
+    # Extract city slug from department name
+    slug = dept_lower
+    for suffix in ["police department", "police dept", "pd", "sheriff's office",
+                    "sheriffs office", "sheriff office", "sheriff", "department of police",
+                    "city of", "town of", "county", "parish"]:
+        slug = slug.replace(suffix, "")
+    slug = slug.strip().replace(" ", "")
+
+    if slug:
+        import socket
+        # Build candidate list based on department type
+        patterns = []
+        if "county" not in dept_lower and "parish" not in dept_lower:
+            # City PD — try .gov/.us patterns
+            patterns = [
+                f"records@{slug}.gov", f"publicrecords@{slug}.gov",
+                f"foia@{slug}.gov", f"records@{slug}.us",
+            ]
+        # Also try portal domain for email (e.g., records@jaxsheriff.org)
+        if query_domain:
+            patterns.extend([
+                f"records@{query_domain}",
+                f"publicrecords@{query_domain}",
+                f"foia@{query_domain}",
+            ])
+
+        for pattern in patterns:
+            domain = pattern.split("@")[1]
+            try:
+                socket.getaddrinfo(domain, 25, socket.AF_INET, socket.SOCK_STREAM)
+                print(f"  Email fallback: verified pattern {pattern}", flush=True)
+                return pattern
+            except (socket.gaierror, OSError):
+                continue
+
     return ""
 
 
@@ -731,8 +767,11 @@ def run():
                 failed += 1
             elif ("no visible form" in error.lower()
                   or "no form elements" in error.lower()
-                  or "0 visible form" in error.lower()):
-                # Info page — URL has no form, try email fallback
+                  or "0 visible form" in error.lower()
+                  or "could not find/submit" in error.lower()
+                  or "navigator explored" in error.lower()
+                  or "none could be filled" in error.lower()):
+                # No usable form found — try email fallback
                 print(f"  Info page detected (no form). Trying email fallback...", flush=True)
                 dept_email = _lookup_dept_email(client, dept, portal_url)
                 foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
