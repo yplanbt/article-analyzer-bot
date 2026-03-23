@@ -129,13 +129,13 @@ def submit_to_portal(
 
             # Tier 2: If generic filler failed, try DOM-based AI filler (cheap)
             if not result.get("success") and result.get("portal_type") == "unknown":
-                openai_key = os.environ.get("OPENAI_API_KEY", "")
-                if openai_key:
-                    print(f"  Trying DOM-based AI filler (GPT-4o-mini)...")
+                gemini_key = os.environ.get("GEMINI_API_KEY", "")
+                if gemini_key:
+                    print(f"  Trying DOM-based AI filler (Gemini Flash)...")
                     try:
                         ai_dom_result = _ai_fill_form_dom(
                             page, request_body, subject, requester_name,
-                            requester_email, police_dept, openai_key
+                            requester_email, police_dept, gemini_key
                         )
                         if ai_dom_result.get("success"):
                             browser.close()
@@ -924,21 +924,15 @@ def _submit_generic(page, url, body, subject, name, email):
 # Tier 2: DOM-based AI form filler (cheap, uses GPT-4o-mini text-only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _ai_fill_form_dom(page, body, subject, name, email, police_dept, openai_key):
-    """Use GPT-4o-mini with DOM extraction to fill unknown portal forms.
+def _ai_fill_form_dom(page, body, subject, name, email, police_dept, gemini_key):
+    """Use Gemini Flash with DOM extraction to fill unknown portal forms.
 
     Instead of expensive screenshots, extracts form structure as text and asks
-    a cheap LLM to map fields to values. ~$0.01 per submission vs $0.50+ for vision.
+    a cheap LLM to map fields to values. Essentially free with Gemini Flash.
     """
     import json as _json
-
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return {"success": False, "error": "OpenAI package not installed"}
-
-    client = OpenAI(api_key=openai_key)
-    model = os.environ.get("BROWSER_USE_MODEL", "gpt-4o-mini")
+    import urllib.request
+    import urllib.error
 
     # Step 1: Extract all visible form elements from the page
     form_elements = page.evaluate("""() => {
@@ -1013,13 +1007,23 @@ Rules:
 - Return ONLY the JSON array, no other text"""
 
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=800,
-            temperature=0,
+        gemini_url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.0-flash:generateContent?key=" + gemini_key
         )
-        raw = response.choices[0].message.content.strip()
+        payload = _json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 800},
+        }).encode()
+        req = urllib.request.Request(
+            gemini_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_data = _json.loads(resp.read().decode())
+
+        raw = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
         # Parse JSON from response
         json_match = re.search(r'\[[\s\S]*\]', raw)

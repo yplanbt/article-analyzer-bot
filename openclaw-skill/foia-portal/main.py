@@ -47,7 +47,7 @@ except ImportError:
                 portal_url=portal_url, request_body=request_body, subject=subject,
                 requester_name=requester_name, requester_email=requester_email,
                 police_dept=police_dept,
-                openai_key=os.environ.get("OPENAI_API_KEY", ""),
+                openai_key=os.environ.get("GEMINI_API_KEY", ""),
                 anthropic_key=anthropic_key, proxy=proxy,
             )
     except ImportError:
@@ -58,9 +58,7 @@ except ImportError:
         sys.exit(1)
 
 
-# Use cheap model for DOM-based AI form filler (Tier 2)
-if "BROWSER_USE_MODEL" not in os.environ:
-    os.environ["BROWSER_USE_MODEL"] = "gpt-4o-mini"
+# Tier 2 DOM AI filler now uses Gemini Flash (no OpenAI key needed)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -73,11 +71,11 @@ REQUESTER_EMAIL = CONFIG["requester_email"]
 REQUESTER_NAME = CONFIG["requester_name"]
 SA_KEY_PATH = os.path.expanduser(CONFIG["sa_key_path"])
 
-# Propagate OpenAI key from skill config if not in env
-if "OPENAI_API_KEY" not in os.environ:
-    _oai_key = CONFIG.get("openai_api_key", "")
-    if _oai_key:
-        os.environ["OPENAI_API_KEY"] = _oai_key
+# Propagate Gemini key from skill config if not in env
+if "GEMINI_API_KEY" not in os.environ:
+    _gemini_key = CONFIG.get("gemini_api_key", "")
+    if _gemini_key:
+        os.environ["GEMINI_API_KEY"] = _gemini_key
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -437,10 +435,10 @@ def run():
     print("FOIA Portal Skill: Starting...", flush=True)
 
     # Startup diagnostics
-    if os.environ.get("OPENAI_API_KEY"):
-        print("Tier 2 (DOM AI filler): ENABLED", flush=True)
+    if os.environ.get("GEMINI_API_KEY"):
+        print("Tier 2 (DOM AI filler): ENABLED (Gemini Flash)", flush=True)
     else:
-        print("Tier 2 (DOM AI filler): DISABLED — set OPENAI_API_KEY to enable", flush=True)
+        print("Tier 2 (DOM AI filler): DISABLED — set GEMINI_API_KEY to enable", flush=True)
     if os.environ.get("US_PROXY"):
         print(f"Proxy: ENABLED", flush=True)
     else:
