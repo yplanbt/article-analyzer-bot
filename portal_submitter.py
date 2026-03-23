@@ -1142,7 +1142,7 @@ def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police
         )
         payload = _json.dumps({
             "contents": [{"parts": [{"text": prompt_text}]}],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 600},
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024},
         }).encode()
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1331,31 +1331,31 @@ def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police
             print(f"  Navigator: no links found on page, giving up", flush=True)
             break
 
-        # Filter out already-visited URLs
+        # Filter out already-visited URLs and simplify link data to reduce token count
         unvisited_links = [l for l in links if l.get("href", "") not in visited_urls]
         if not unvisited_links:
-            unvisited_links = links  # All visited, let Gemini decide anyway
+            unvisited_links = links
 
-        nav_prompt = f"""You are navigating a government website to find the FOIA / public records request form.
+        # Simplify links to just text + href to keep prompt short
+        simple_links = []
+        for l in unvisited_links[:25]:
+            entry = {"text": l.get("text", "")[:60], "type": l["type"]}
+            if l.get("href"):
+                entry["href"] = l["href"]
+            simple_links.append(entry)
 
-Current page: {page.title()} ({current_url})
-Department: {police_dept}
-Form fields on current page: {form_count}
+        nav_prompt = f"""Find the FOIA/public records request FORM page on this government website.
 
-Available links and buttons on this page:
-{_json.dumps(unvisited_links[:30], indent=2)}
+Page: {page.title()} ({current_url})
+Dept: {police_dept}
 
-Which link or button should I click to reach the page where I can SUBMIT a public records / FOIA request?
+Links on page:
+{_json.dumps(simple_links, separators=(',', ':'))}
 
-Look for links containing keywords like: "records request", "submit request", "FOIA", "public records",
-"file a request", "new request", "create request", "make a request", "online form", "request form".
+Pick the link most likely to lead to a records request submission form. Look for: "records request", "submit request", "FOIA", "public records", "file a request", "new request", "online form".
 
-If this looks like a login page, look for "Register" or "Create Account" links.
-
-If none of the links look relevant, say "NONE".
-
-Return ONLY valid JSON (no markdown):
-{{"action": "click_link" or "click_button" or "none", "target": "the exact href URL for links, or the exact button text for buttons", "reason": "brief explanation"}}"""
+Return ONLY this JSON (no markdown, no explanation):
+{{"action":"click_link","target":"THE_URL","reason":"why"}}"""
 
         try:
             nav_response = _gemini_ask(nav_prompt)
