@@ -528,14 +528,14 @@ def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
         return False
 
     # Step 2: Connect to MX server and try RCPT TO
+    import smtplib
+    smtp = None
     try:
-        import smtplib
         smtp = smtplib.SMTP(timeout=timeout)
         smtp.connect(mx_host, 25)
         smtp.ehlo("verify.local")
         smtp.mail("")
         code, msg = smtp.rcpt(email_addr)
-        smtp.quit()
 
         if code == 250:
             logger.info("_verify_mailbox: %s ACCEPTED (code %d)", email_addr, code)
@@ -544,21 +544,23 @@ def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
             logger.warning("_verify_mailbox: %s REJECTED (code %d: %s)", email_addr, code, msg.decode(errors="replace"))
             return False
         else:
-            # Unknown response (e.g. 252 "cannot verify") — accept cautiously
             logger.info("_verify_mailbox: %s ambiguous response (code %d) — accepting", email_addr, code)
             return True
     except smtplib.SMTPServerDisconnected:
-        # Server disconnected — may block RCPT TO. Accept if domain has MX.
         logger.debug("_verify_mailbox: %s — server disconnected, accepting (has MX)", email_addr)
         return True
     except (socket.timeout, OSError) as e:
-        # Timeout connecting — server exists but slow. Accept if domain has MX.
         logger.debug("_verify_mailbox: %s — timeout: %s, accepting (has MX)", email_addr, e)
         return True
     except (socket.gaierror, smtplib.SMTPException) as e:
-        # Can't resolve MX host or SMTP error — reject
         logger.warning("_verify_mailbox: %s — connection failed: %s, rejecting", email_addr, e)
         return False
+    finally:
+        if smtp:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
 
 
 def _email_tld_confidence(email: str) -> str:
@@ -983,7 +985,7 @@ def process_single_request(
                 f"foia@{city_slug}.gov",
                 f"records@{city_slug}.us",
             ]:
-                if _verify_email_domain(candidate) and _email_tld_confidence(candidate) == "high":
+                if _verify_email_domain(candidate) and _email_tld_confidence(candidate) == "high" and _verify_mailbox(candidate):
                     logger.info(
                         "process_single_request: found verified email %s for portal-only dept %s",
                         candidate, dept_name,
@@ -1202,8 +1204,11 @@ def _guess_pd_email(police_dept: str, state: str) -> str:
         if _verify_email_domain(email_candidate):
             tld_conf = _email_tld_confidence(email_candidate)
             if tld_conf in ("high", "medium"):
-                logger.info("_guess_pd_email: verified pattern email: %s", email_candidate)
-                return email_candidate
+                if _verify_mailbox(email_candidate):
+                    logger.info("_guess_pd_email: verified pattern email (domain+mailbox): %s", email_candidate)
+                    return email_candidate
+                else:
+                    logger.info("_guess_pd_email: %s domain OK but mailbox rejected", email_candidate)
 
     return ""
 
@@ -1260,30 +1265,38 @@ def check_bounced_emails(foia_email: str, foia_password: str) -> "list[str]":
             return []
 
         for num in msg_nums[0].split():
-            _, data = mail.fetch(num, "(RFC822)")
-            if not data or not data[0]:
-                continue
-            raw = data[0][1]
-            msg = email_lib.message_from_bytes(raw)
+            try:
+                _, data = mail.fetch(num, "(RFC822)")
+                if not data or not data[0] or not isinstance(data[0], tuple) or len(data[0]) < 2:
+                    continue
+                raw = data[0][1]
+                if not isinstance(raw, bytes):
+                    continue
+                msg = email_lib.message_from_bytes(raw)
 
-            # Extract bounced recipient from body
-            body_text = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body_text += part.get_payload(decode=True).decode(errors="replace")
-            else:
-                body_text = msg.get_payload(decode=True).decode(errors="replace")
+                # Extract bounced recipient from body
+                body_text = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body_text += payload.decode(errors="replace")
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        body_text = payload.decode(errors="replace")
 
-            # Common patterns in bounce messages
-            found = re.findall(r'(?:delivery.*?failed|undeliverable|rejected).*?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', body_text, re.IGNORECASE | re.DOTALL)
-            if not found:
-                # Try simpler: just find email addresses in the bounce
-                found = re.findall(r'<([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)>', body_text)
-                # Filter out our own email
+                # Common patterns in bounce messages
+                found = re.findall(r'(?:delivery.*?failed|undeliverable|rejected).*?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', body_text, re.IGNORECASE | re.DOTALL)
+                if not found:
+                    found = re.findall(r'<([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)>', body_text)
+
+                # Filter out our own email from ALL results
                 found = [e for e in found if e.lower() != foia_email.lower()]
-
-            bounced_addrs.extend(found)
+                bounced_addrs.extend(found)
+            except Exception:
+                continue
 
         mail.logout()
     except Exception as e:

@@ -1042,7 +1042,13 @@ Rules:
         with urllib.request.urlopen(req, timeout=30) as resp:
             resp_data = _json.loads(resp.read().decode())
 
-        raw = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        candidates = resp_data.get("candidates", [])
+        if not candidates or "content" not in candidates[0]:
+            return {"success": False, "error": "Gemini returned empty response"}
+        parts = candidates[0]["content"].get("parts", [])
+        if not parts or "text" not in parts[0]:
+            return {"success": False, "error": "Gemini returned no text"}
+        raw = parts[0]["text"].strip()
 
         # Parse JSON from response
         json_match = re.search(r'\[[\s\S]*\]', raw)
@@ -1148,8 +1154,10 @@ def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = _json.loads(resp.read().decode())
-        # Gemini may return multiple parts (thinking + response) — get the last text part
-        parts = data["candidates"][0]["content"]["parts"]
+        candidates = data.get("candidates", [])
+        if not candidates or "content" not in candidates[0]:
+            return ""
+        parts = candidates[0]["content"].get("parts", [])
         for part in reversed(parts):
             if "text" in part:
                 return part["text"].strip()
@@ -1370,7 +1378,7 @@ Return ONLY this JSON (no markdown, no explanation):
             if "```" in cleaned:
                 cleaned = re.sub(r'```(?:json)?\s*', '', cleaned).strip()
             print(f"    Navigator raw response: {cleaned[:200]}", flush=True)
-            nav_json = re.search(r'\{[\s\S]*\}', cleaned)
+            nav_json = re.search(r'\{[^{}]*\}', cleaned)
             if not nav_json:
                 print(f"  Navigator: Gemini returned unparseable response, continuing...", flush=True)
                 continue

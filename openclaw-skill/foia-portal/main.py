@@ -452,14 +452,19 @@ def _lookup_dept_email(client, dept_name, portal_url):
                 f"foia@{query_domain}",
             ])
 
-        for pattern in patterns:
-            domain = pattern.split("@")[1]
-            try:
-                socket.getaddrinfo(domain, 25, socket.AF_INET, socket.SOCK_STREAM)
-                print(f"  Email fallback: verified pattern {pattern}", flush=True)
-                return pattern
-            except (socket.gaierror, OSError):
-                continue
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(5)  # Prevent hanging on DNS lookup
+        try:
+            for pattern in patterns:
+                domain = pattern.split("@")[1]
+                try:
+                    socket.getaddrinfo(domain, 25, socket.AF_INET, socket.SOCK_STREAM)
+                    print(f"  Email fallback: verified pattern {pattern}", flush=True)
+                    return pattern
+                except (socket.gaierror, OSError, socket.timeout):
+                    continue
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
     return ""
 

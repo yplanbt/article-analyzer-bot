@@ -944,7 +944,7 @@ with tab_dash:
                 font_color="rgba(255,255,255,0.7)",
                 annotations=[dict(text=f"{len(_dash_foia_requests)}", x=0.5, y=0.5, font_size=28, font_color="white", showarrow=False)],
             )
-            st.plotly_chart(fig_donut, width="stretch", key="dash_donut")
+            st.plotly_chart(fig_donut, use_container_width=True, key="dash_donut")
         else:
             st.info("No requests yet")
 
@@ -1180,7 +1180,7 @@ with tab_dash:
                         xaxis=dict(gridcolor="rgba(255,255,255,0.04)", title=""),
                         yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title=""),
                     )
-                    st.plotly_chart(fig_timeline, width="stretch", key="dash_timeline")
+                    st.plotly_chart(fig_timeline, use_container_width=True, key="dash_timeline")
 
         with _chart2_col:
             st.markdown('<p class="section-label">Requests by State</p>', unsafe_allow_html=True)
@@ -1203,7 +1203,7 @@ with tab_dash:
                     yaxis=dict(title="", autorange="reversed"),
                     showlegend=False,
                 )
-                st.plotly_chart(fig_states, width="stretch", key="dash_states")
+                st.plotly_chart(fig_states, use_container_width=True, key="dash_states")
 
         st.divider()
 
