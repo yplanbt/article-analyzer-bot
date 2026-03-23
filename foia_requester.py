@@ -467,8 +467,19 @@ def _verify_email_domain(email: str) -> bool:
             capture_output=True, text=True, timeout=5,
         )
         if mx_result.returncode == 0 and mx_result.stdout.strip():
-            logger.debug("_verify_email_domain: domain '%s' has MX records", domain)
-            return True
+            mx_output = mx_result.stdout.strip()
+            # RFC 7505: null MX "0 ." means domain explicitly does NOT accept email
+            if mx_output.rstrip(".").strip() in ("0", "0 .", "0 ."):
+                logger.debug("_verify_email_domain: domain '%s' has null MX (RFC 7505) — rejects email", domain)
+                return False
+            # Check for real MX records (not just ".")
+            mx_hosts = [l.split()[-1].rstrip(".") for l in mx_output.split("\n") if l.strip()]
+            if any(h and h != "." and h != "" for h in mx_hosts):
+                logger.debug("_verify_email_domain: domain '%s' has MX records", domain)
+                return True
+            else:
+                logger.debug("_verify_email_domain: domain '%s' has only null MX entries", domain)
+                return False
     except Exception:
         pass
     # Fallback to A record resolution
@@ -485,9 +496,9 @@ def _verify_email_domain(email: str) -> bool:
 def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
     """Check if a specific mailbox exists via SMTP RCPT TO (no email sent).
 
-    Connects to the recipient's mail server and checks if the mailbox is valid.
-    Returns True if the server accepts the recipient, False if it rejects.
-    Returns True (optimistic) if the server doesn't support verification.
+    Conservative: rejects addresses when the domain has no MX records or when
+    the mail server explicitly rejects the recipient. Only returns True when
+    the server positively confirms the mailbox exists (code 250).
     """
     import socket
     import subprocess
@@ -496,7 +507,7 @@ def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
     domain = email_addr.split("@")[1].lower().strip()
     logger.info("_verify_mailbox: checking %s", email_addr)
 
-    # Step 1: Get MX server for the domain
+    # Step 1: Get MX server for the domain — REQUIRED
     mx_host = None
     try:
         mx_result = subprocess.run(
@@ -504,7 +515,6 @@ def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
             capture_output=True, text=True, timeout=5,
         )
         if mx_result.returncode == 0 and mx_result.stdout.strip():
-            # MX records format: "10 mail.example.com." — take lowest priority
             mx_lines = [l.strip() for l in mx_result.stdout.strip().split("\n") if l.strip()]
             mx_lines.sort(key=lambda x: int(x.split()[0]) if x.split()[0].isdigit() else 999)
             if mx_lines:
@@ -513,8 +523,9 @@ def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
         logger.debug("_verify_mailbox: MX lookup failed for %s: %s", domain, e)
 
     if not mx_host:
-        logger.debug("_verify_mailbox: no MX found for %s — falling back to domain", domain)
-        mx_host = domain
+        # No MX record = domain can't receive email. Reject.
+        logger.warning("_verify_mailbox: %s — no MX records, domain can't receive email", email_addr)
+        return False
 
     # Step 2: Connect to MX server and try RCPT TO
     try:
@@ -533,17 +544,21 @@ def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
             logger.warning("_verify_mailbox: %s REJECTED (code %d: %s)", email_addr, code, msg.decode(errors="replace"))
             return False
         else:
-            # Unknown response — assume valid (optimistic)
-            logger.info("_verify_mailbox: %s unknown response (code %d) — assuming valid", email_addr, code)
+            # Unknown response (e.g. 252 "cannot verify") — accept cautiously
+            logger.info("_verify_mailbox: %s ambiguous response (code %d) — accepting", email_addr, code)
             return True
     except smtplib.SMTPServerDisconnected:
-        # Server disconnected — may block VRFY/RCPT. Assume valid.
-        logger.debug("_verify_mailbox: %s — server disconnected, assuming valid", email_addr)
+        # Server disconnected — may block RCPT TO. Accept if domain has MX.
+        logger.debug("_verify_mailbox: %s — server disconnected, accepting (has MX)", email_addr)
         return True
-    except (socket.timeout, socket.gaierror, OSError, smtplib.SMTPException) as e:
-        # Connection failed — can't verify. Assume valid (optimistic).
-        logger.debug("_verify_mailbox: %s — connection failed: %s, assuming valid", email_addr, e)
+    except (socket.timeout, OSError) as e:
+        # Timeout connecting — server exists but slow. Accept if domain has MX.
+        logger.debug("_verify_mailbox: %s — timeout: %s, accepting (has MX)", email_addr, e)
         return True
+    except (socket.gaierror, smtplib.SMTPException) as e:
+        # Can't resolve MX host or SMTP error — reject
+        logger.warning("_verify_mailbox: %s — connection failed: %s, rejecting", email_addr, e)
+        return False
 
 
 def _email_tld_confidence(email: str) -> str:
