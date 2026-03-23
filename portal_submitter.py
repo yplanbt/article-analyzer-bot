@@ -128,21 +128,35 @@ def submit_to_portal(
                                           requester_name, requester_email)
 
             # Tier 2: If generic filler failed, try DOM-based AI filler (cheap)
-            if not result.get("success") and result.get("portal_type") == "unknown":
-                gemini_key = os.environ.get("GEMINI_API_KEY", "")
-                if gemini_key:
-                    print(f"  Trying DOM-based AI filler (Gemini Flash)...")
-                    try:
-                        ai_dom_result = _ai_fill_form_dom(
-                            page, request_body, subject, requester_name,
-                            requester_email, police_dept, gemini_key
-                        )
-                        if ai_dom_result.get("success"):
-                            browser.close()
-                            return ai_dom_result
-                        print(f"  DOM AI filler: {ai_dom_result.get('error', 'failed')}")
-                    except Exception as e:
-                        print(f"  DOM AI filler error: {e}")
+            gemini_key = os.environ.get("GEMINI_API_KEY", "")
+            if not result.get("success") and result.get("portal_type") == "unknown" and gemini_key:
+                print(f"  Trying DOM-based AI filler (Gemini Flash)...", flush=True)
+                try:
+                    ai_dom_result = _ai_fill_form_dom(
+                        page, request_body, subject, requester_name,
+                        requester_email, police_dept, gemini_key
+                    )
+                    if ai_dom_result.get("success"):
+                        browser.close()
+                        return ai_dom_result
+                    print(f"  DOM AI filler: {ai_dom_result.get('error', 'failed')}", flush=True)
+                except Exception as e:
+                    print(f"  DOM AI filler error: {e}", flush=True)
+
+                # Tier 2.5: AI Navigator — explore the site to find the form
+                print(f"  Trying AI Navigator (site exploration)...", flush=True)
+                try:
+                    nav_result = _ai_navigate_and_submit(
+                        page, portal_url, request_body, subject,
+                        requester_name, requester_email, police_dept,
+                        gemini_key, portal_credentials,
+                    )
+                    if nav_result.get("success"):
+                        browser.close()
+                        return nav_result
+                    print(f"  AI Navigator: {nav_result.get('error', 'failed')}", flush=True)
+                except Exception as e:
+                    print(f"  AI Navigator error: {e}", flush=True)
 
             browser.close()
 
@@ -1088,7 +1102,7 @@ Rules:
         conf = _extract_confirmation(page)
         return {
             "success": True,
-            "message": f"Submitted via DOM AI filler ({model}, {filled_count} fields)",
+            "message": f"Submitted via DOM AI filler (Gemini Flash, {filled_count} fields)",
             "confirmation": conf,
             "portal_type": "ai_dom",
         }
@@ -1098,6 +1112,294 @@ Rules:
         "success": False,
         "error": f"DOM AI filled {filled_count} fields but submit button not found",
         "portal_type": "ai_dom",
+    }
+
+
+def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police_dept, gemini_key, creds=None):
+    """AI-driven site navigator: explores a portal to find and submit a FOIA form.
+
+    When the initial page has no form (info page, landing page, etc.), this function:
+    1. Extracts all links/buttons from the current page
+    2. Asks Gemini which one leads to the FOIA request form
+    3. Clicks it and checks for a form
+    4. If it hits a login/register page, creates an account first
+    5. Repeats up to MAX_NAV_STEPS times until a form is found and submitted
+    """
+    import json as _json
+    import urllib.request
+
+    MAX_NAV_STEPS = 6
+    visited_urls = set()
+
+    cred_email = (creds or {}).get("email", email)
+    cred_password = (creds or {}).get("password", "F0ia2024!Req")
+
+    def _gemini_ask(prompt_text):
+        """Send a text prompt to Gemini and return the response text."""
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-flash:generateContent?key=" + gemini_key
+        )
+        payload = _json.dumps({
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 600},
+        }).encode()
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read().decode())
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    def _extract_page_links(pg):
+        """Extract visible links and buttons from the page."""
+        return pg.evaluate("""() => {
+            const items = [];
+            // Links
+            document.querySelectorAll('a[href]').forEach(a => {
+                const rect = a.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    items.push({
+                        type: 'link',
+                        text: a.textContent.trim().substring(0, 80),
+                        href: a.href,
+                        id: a.id || '',
+                        classes: a.className || ''
+                    });
+                }
+            });
+            // Buttons
+            document.querySelectorAll('button, input[type="button"], input[type="submit"]').forEach(b => {
+                const rect = b.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    items.push({
+                        type: 'button',
+                        text: (b.textContent || b.value || '').trim().substring(0, 80),
+                        id: b.id || '',
+                        classes: b.className || ''
+                    });
+                }
+            });
+            return items.slice(0, 50);
+        }""")
+
+    def _count_form_fields(pg):
+        return pg.locator("input:visible, textarea:visible, select:visible").count()
+
+    def _is_login_page(pg):
+        """Check if current page looks like a login/register page."""
+        html_lower = pg.content()[:5000].lower()
+        return any(kw in html_lower for kw in [
+            "sign in", "log in", "login", "username", "password",
+            "create account", "register", "sign up",
+        ])
+
+    def _try_register_and_login(pg):
+        """Try to create an account and log in on the current page."""
+        print(f"    Navigator: attempting account registration...", flush=True)
+        # Look for registration link if we're on login page
+        reg_link = None
+        for selector in [
+            "a:has-text('Register')", "a:has-text('Create Account')",
+            "a:has-text('Sign Up')", "a:has-text('Create an Account')",
+            "a:has-text('register')", "a:has-text('sign up')",
+        ]:
+            try:
+                loc = pg.locator(selector).first
+                if loc.is_visible():
+                    reg_link = loc
+                    break
+            except Exception:
+                continue
+
+        if reg_link:
+            reg_link.click()
+            time.sleep(3)
+            pg.wait_for_load_state("networkidle")
+            print(f"    Navigator: navigated to registration page: {pg.url}", flush=True)
+
+        # Try to fill registration form
+        reg_fields = {
+            "email": cred_email,
+            "first_name": name.split()[0] if name else "S",
+            "last_name": name.split()[-1] if name and len(name.split()) > 1 else "Jaden",
+            "password": cred_password,
+            "confirm_password": cred_password,
+            "phone": "0000000000",
+        }
+
+        filled = 0
+        for field_key, field_val in reg_fields.items():
+            for sel in [
+                f"input[name*='{field_key}']",
+                f"input[id*='{field_key}']",
+                f"input[placeholder*='{field_key}']",
+            ]:
+                try:
+                    loc = pg.locator(sel).first
+                    if loc.is_visible():
+                        loc.click()
+                        loc.fill(field_val)
+                        filled += 1
+                        break
+                except Exception:
+                    continue
+
+        # Also try password fields specifically
+        for pwd_sel in ["input[type='password']", "input[name*='password']", "input[id*='password']"]:
+            try:
+                pwd_fields = pg.locator(pwd_sel).all()
+                for pf in pwd_fields:
+                    if pf.is_visible():
+                        pf.click()
+                        pf.fill(cred_password)
+                        filled += 1
+            except Exception:
+                pass
+
+        if filled >= 2:
+            _check_required_boxes(pg)
+            # Click register/submit
+            for btn_text in ["Register", "Create Account", "Sign Up", "Submit"]:
+                try:
+                    btn = pg.locator(f"button:has-text('{btn_text}'), input[value*='{btn_text}']").first
+                    if btn.is_visible():
+                        btn.click()
+                        time.sleep(4)
+                        pg.wait_for_load_state("networkidle")
+                        print(f"    Navigator: registration submitted, now at: {pg.url}", flush=True)
+                        return True
+                except Exception:
+                    continue
+
+        print(f"    Navigator: registration fill incomplete ({filled} fields)", flush=True)
+        return False
+
+    print(f"  AI Navigator: starting site exploration from {portal_url}", flush=True)
+    visited_urls.add(page.url)
+
+    for step in range(MAX_NAV_STEPS):
+        current_url = page.url
+        form_count = _count_form_fields(page)
+        print(f"  Navigator step {step + 1}/{MAX_NAV_STEPS}: {current_url} ({form_count} form fields)", flush=True)
+
+        # Found a form with enough fields — try to fill and submit
+        if form_count >= 3:
+            print(f"  Navigator: found form with {form_count} fields — attempting fill", flush=True)
+            # Try label + CSS fill first
+            label_count = _fill_by_labels(page, body, subject, name, email)
+            css_count = _fill_form_fields(page, body, subject, name, email)
+            total = label_count + css_count
+            _fill_phone_field(page, "000-000-0000")
+            _check_required_boxes(page)
+
+            if total == 0:
+                # Try Gemini DOM filler
+                ai_result = _ai_fill_form_dom(page, body, subject, name, email, police_dept, gemini_key)
+                if ai_result.get("success"):
+                    ai_result["message"] = f"Navigator found form + {ai_result.get('message', '')}"
+                    return ai_result
+                print(f"  Navigator: Gemini filler also failed, continuing exploration", flush=True)
+            else:
+                submitted = _click_submit(page)
+                if submitted:
+                    time.sleep(3)
+                    conf = _extract_confirmation(page)
+                    return {
+                        "success": True,
+                        "message": f"Navigator found form and submitted ({total} fields, {step + 1} nav steps)",
+                        "confirmation": conf,
+                        "portal_type": "ai_navigator",
+                    }
+                else:
+                    print(f"  Navigator: filled {total} fields but no submit button found", flush=True)
+
+        # Check if we're on a login/register page
+        if _is_login_page(page) and form_count >= 2:
+            registered = _try_register_and_login(page)
+            if registered:
+                visited_urls.add(page.url)
+                continue
+
+        # Extract links and ask Gemini where to go
+        links = _extract_page_links(page)
+        if not links:
+            print(f"  Navigator: no links found on page, giving up", flush=True)
+            break
+
+        # Filter out already-visited URLs
+        unvisited_links = [l for l in links if l.get("href", "") not in visited_urls]
+        if not unvisited_links:
+            unvisited_links = links  # All visited, let Gemini decide anyway
+
+        nav_prompt = f"""You are navigating a government website to find the FOIA / public records request form.
+
+Current page: {page.title()} ({current_url})
+Department: {police_dept}
+Form fields on current page: {form_count}
+
+Available links and buttons on this page:
+{_json.dumps(unvisited_links[:30], indent=2)}
+
+Which link or button should I click to reach the page where I can SUBMIT a public records / FOIA request?
+
+Look for links containing keywords like: "records request", "submit request", "FOIA", "public records",
+"file a request", "new request", "create request", "make a request", "online form", "request form".
+
+If this looks like a login page, look for "Register" or "Create Account" links.
+
+If none of the links look relevant, say "NONE".
+
+Return ONLY valid JSON (no markdown):
+{{"action": "click_link" or "click_button" or "none", "target": "the exact href URL for links, or the exact button text for buttons", "reason": "brief explanation"}}"""
+
+        try:
+            nav_response = _gemini_ask(nav_prompt)
+            nav_json = re.search(r'\{[\s\S]*\}', nav_response)
+            if not nav_json:
+                print(f"  Navigator: Gemini returned unparseable response", flush=True)
+                break
+            nav_action = _json.loads(nav_json.group())
+        except Exception as e:
+            print(f"  Navigator: Gemini error: {e}", flush=True)
+            break
+
+        action_type = nav_action.get("action", "none")
+        target = nav_action.get("target", "")
+        reason = nav_action.get("reason", "")
+        print(f"    Navigator decision: {action_type} → {target[:80]} ({reason})", flush=True)
+
+        if action_type == "none" or not target:
+            print(f"  Navigator: no relevant links found, giving up", flush=True)
+            break
+
+        try:
+            if action_type == "click_link" and target.startswith("http"):
+                visited_urls.add(target)
+                page.goto(target, wait_until="networkidle")
+            elif action_type == "click_button":
+                btn = page.locator(f"button:has-text('{target}'), a:has-text('{target}')").first
+                btn.click()
+                page.wait_for_load_state("networkidle")
+            else:
+                # Try as link first, then button
+                try:
+                    page.goto(target, wait_until="networkidle")
+                except Exception:
+                    btn = page.locator(f"a:has-text('{target}'), button:has-text('{target}')").first
+                    btn.click()
+                    page.wait_for_load_state("networkidle")
+
+            visited_urls.add(page.url)
+            time.sleep(2)
+        except Exception as e:
+            print(f"    Navigator: failed to navigate: {e}", flush=True)
+            continue
+
+    _save_debug_screenshot(page, "navigator_exhausted")
+    return {
+        "success": False,
+        "error": f"AI Navigator explored {len(visited_urls)} pages but could not find/submit FOIA form",
+        "portal_type": "ai_navigator",
+        "pages_visited": list(visited_urls),
     }
 
 
