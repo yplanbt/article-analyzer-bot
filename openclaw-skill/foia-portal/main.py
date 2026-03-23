@@ -73,6 +73,12 @@ REQUESTER_EMAIL = CONFIG["requester_email"]
 REQUESTER_NAME = CONFIG["requester_name"]
 SA_KEY_PATH = os.path.expanduser(CONFIG["sa_key_path"])
 
+# Propagate OpenAI key from skill config if not in env
+if "OPENAI_API_KEY" not in os.environ:
+    _oai_key = CONFIG.get("openai_api_key", "")
+    if _oai_key:
+        os.environ["OPENAI_API_KEY"] = _oai_key
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -429,6 +435,16 @@ def _lookup_dept_email(client, dept_name, portal_url):
 def run():
     """Main skill entry point. Called by OpenClaw on manual trigger."""
     print("FOIA Portal Skill: Starting...", flush=True)
+
+    # Startup diagnostics
+    if os.environ.get("OPENAI_API_KEY"):
+        print("Tier 2 (DOM AI filler): ENABLED", flush=True)
+    else:
+        print("Tier 2 (DOM AI filler): DISABLED — set OPENAI_API_KEY to enable", flush=True)
+    if os.environ.get("US_PROXY"):
+        print(f"Proxy: ENABLED", flush=True)
+    else:
+        print("Proxy: DISABLED (direct connection)", flush=True)
 
     # 1. Connect to Google Sheets
     try:

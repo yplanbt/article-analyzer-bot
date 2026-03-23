@@ -830,26 +830,57 @@ def _submit_formcenter(page, url, body, subject, name, email, creds):
 
 def _submit_generic(page, url, body, subject, name, email):
     """Smart generic portal handler — tries multiple strategies to fill and submit."""
+    print(f"  Generic handler: loading {url}", flush=True)
     page.goto(url, wait_until="networkidle")
     time.sleep(3)  # Extra wait for JS-rendered forms
 
     try:
+        # Count visible form elements for diagnostics
+        form_count = page.locator("input:visible, textarea:visible, select:visible").count()
+        print(f"  Found {form_count} visible form elements on page", flush=True)
+
+        if form_count == 0:
+            _save_debug_screenshot(page, "generic_noform")
+            return {
+                "success": False,
+                "error": "No visible form elements found on page",
+                "portal_type": "unknown",
+                "needs_manual": True,
+                "page_url": page.url,
+            }
+
         # Check for iframes that might contain the form
         iframe_page = _find_form_iframe(page)
         target = iframe_page if iframe_page else page
+        if iframe_page:
+            print(f"  Found form inside iframe", flush=True)
 
         # Strategy 1: Label-based matching (works on most CMS forms)
-        filled_labels = _fill_by_labels(target, body, subject, name, email)
+        label_count = _fill_by_labels(target, body, subject, name, email)
+        print(f"  Strategy 1 (labels): filled {label_count} fields", flush=True)
 
-        # Strategy 2: Standard CSS selectors
-        if not filled_labels:
-            _fill_form_fields(target, body, subject, name, email)
+        # Strategy 2: Standard CSS selectors (always run as supplement)
+        css_count = _fill_form_fields(target, body, subject, name, email)
+        print(f"  Strategy 2 (CSS selectors): filled {css_count} fields", flush=True)
+
+        total_filled = label_count + css_count
 
         # Fill phone if visible
         _fill_phone_field(target, "000-000-0000")
 
         # Check required boxes
         _check_required_boxes(target)
+
+        if total_filled == 0:
+            print(f"  WARNING: 0 fields filled out of {form_count} visible elements", flush=True)
+            _save_debug_screenshot(page, "generic_nofill")
+            return {
+                "success": False,
+                "error": f"No fields could be filled ({form_count} elements visible but none matched)",
+                "portal_type": "unknown",
+                "needs_manual": True,
+                "page_url": page.url,
+            }
 
         submitted = _click_submit(target)
 
@@ -858,22 +889,22 @@ def _submit_generic(page, url, body, subject, name, email):
             conf_num = _extract_confirmation(page)  # Check main page for confirmation
             return {
                 "success": True,
-                "message": "Submitted via portal form",
+                "message": f"Submitted via portal form ({total_filled} fields filled)",
                 "confirmation": conf_num,
                 "portal_type": "generic",
             }
         else:
-            _save_debug_screenshot(page, "generic")
+            _save_debug_screenshot(page, "generic_nosubmit")
             return {
                 "success": False,
-                "error": "Could not auto-submit — unknown portal layout",
+                "error": f"Filled {total_filled} fields but could not find submit button",
                 "portal_type": "unknown",
                 "needs_manual": True,
                 "page_url": page.url,
             }
 
     except Exception as e:
-        _save_debug_screenshot(page, "generic")
+        _save_debug_screenshot(page, "generic_error")
         return {"success": False, "error": f"Generic portal error: {str(e)}", "portal_type": "unknown"}
 
 
@@ -1104,22 +1135,22 @@ def _try_login(page, email, password):
             continue
 
 
-def _fill_by_labels(page, body, subject, name, email) -> bool:
+def _fill_by_labels(page, body, subject, name, email):
     """Fill form fields by finding labels and their associated inputs.
 
     Works on FormCenter (Field_[ID]) and other CMS forms that use
     <label for="fieldId">Label Text</label> pattern.
-    Returns True if at least one field was filled.
+    Returns count of fields filled.
     """
     filled = 0
 
     # Map of label text patterns to values
     field_map = [
         (["description", "request", "details", "message", "information",
-          "records requested", "nature of request", "body"], body, "textarea"),
+          "records requested", "nature of request", "body", "comment"], body, "textarea"),
         (["subject", "title", "regarding", "re:"], subject, "input"),
         (["name", "full name", "your name", "requester name",
-          "first name", "contact name"], name, "input"),
+          "first name", "contact name", "requestor"], name, "input"),
         (["email", "e-mail", "email address", "your email",
           "requester email", "contact email"], email, "input"),
     ]
@@ -1134,17 +1165,27 @@ def _fill_by_labels(page, body, subject, name, email) -> bool:
 
                 # Find the associated input via 'for' attribute
                 for_attr = label.get_attribute("for")
-                if not for_attr:
-                    continue
 
                 for patterns, value, field_type in field_map:
                     if any(p in label_text for p in patterns):
-                        if field_type == "textarea":
-                            el = page.locator(f"textarea#{for_attr}, textarea[name='{for_attr}']")
-                        else:
-                            el = page.locator(f"#{for_attr}, input[name='{for_attr}']")
-                        if el.count() > 0 and el.first.is_visible():
+                        el = None
+                        if for_attr:
+                            # Method 1: Use the 'for' attribute
+                            if field_type == "textarea":
+                                el = page.locator(f"textarea#{for_attr}, textarea[name='{for_attr}']")
+                            else:
+                                el = page.locator(f"#{for_attr}, input[name='{for_attr}']")
+                        if not el or el.count() == 0:
+                            # Method 2: Find input that is a sibling/child of the label
+                            if field_type == "textarea":
+                                el = label.locator(".. >> textarea")
+                            else:
+                                el = label.locator(".. >> input:not([type='hidden']):not([type='submit'])")
+
+                        if el and el.count() > 0 and el.first.is_visible():
+                            el.first.click()
                             el.first.fill(value)
+                            print(f"    Label fill: '{label_text[:30]}' -> {value[:40]}...", flush=True)
                             filled += 1
                             break
             except Exception:
@@ -1152,28 +1193,37 @@ def _fill_by_labels(page, body, subject, name, email) -> bool:
     except Exception:
         pass
 
-    return filled > 0
+    return filled
 
 
 def _fill_form_fields(page, body, subject, name, email):
-    """Try to fill common form fields using CSS selectors."""
+    """Try to fill common form fields using CSS selectors. Returns count of fields filled."""
+    filled = 0
+
+    def _try_fill(selectors, value, field_name):
+        for selector in selectors:
+            try:
+                el = page.locator(selector)
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.click()
+                    el.first.fill(value)
+                    print(f"    CSS fill: {field_name} via {selector}", flush=True)
+                    return 1
+            except Exception:
+                continue
+        return 0
+
     # Subject / Title field
-    for selector in [
+    filled += _try_fill([
         "input[name*='subject' i]", "input[name*='title' i]",
         "input[placeholder*='subject' i]", "input[placeholder*='title' i]",
         "input[aria-label*='subject' i]", "input[aria-label*='title' i]",
         "#subject", "#title", "#request_title",
         "input[id*='subject' i]", "input[id*='title' i]",
-    ]:
-        try:
-            if page.locator(selector).count() > 0:
-                page.locator(selector).first.fill(subject)
-                break
-        except Exception:
-            continue
+    ], subject, "subject")
 
     # Main request body / description
-    for selector in [
+    filled += _try_fill([
         "textarea[name*='description' i]", "textarea[name*='body' i]",
         "textarea[name*='request' i]", "textarea[name*='message' i]",
         "textarea[name*='details' i]", "textarea[name*='content' i]",
@@ -1186,42 +1236,25 @@ def _fill_form_fields(page, body, subject, name, email):
         "textarea[id^='Field_']",
         # Last resort: first textarea on page
         "textarea",
-    ]:
-        try:
-            if page.locator(selector).count() > 0:
-                page.locator(selector).first.fill(body)
-                break
-        except Exception:
-            continue
+    ], body, "body/description")
 
     # Name field
-    for selector in [
+    filled += _try_fill([
         "input[name*='name' i]:not([name*='email']):not([name*='user']):not([name*='pass'])",
         "input[placeholder*='name' i]:not([placeholder*='email'])",
         "input[aria-label*='name' i]:not([aria-label*='email'])",
         "#name", "#requester_name", "#full_name", "#contact_name",
         "input[id*='name' i]:not([id*='email']):not([id*='user'])",
-    ]:
-        try:
-            el = page.locator(selector)
-            if el.count() > 0 and el.first.is_visible():
-                el.first.fill(name)
-                break
-        except Exception:
-            continue
+    ], name, "name")
 
     # Email field
-    for selector in [
+    filled += _try_fill([
         "input[type='email']", "input[name*='email' i]",
         "input[placeholder*='email' i]", "#email", "#requester_email",
         "input[id*='email' i]", "input[aria-label*='email' i]",
-    ]:
-        try:
-            if page.locator(selector).count() > 0:
-                page.locator(selector).first.fill(email)
-                break
-        except Exception:
-            continue
+    ], email, "email")
+
+    return filled
 
 
 def _fill_phone_field(page, phone):
