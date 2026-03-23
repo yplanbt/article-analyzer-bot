@@ -1274,6 +1274,12 @@ def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police
         return False
 
     print(f"  AI Navigator: starting site exploration from {portal_url}", flush=True)
+    # Reload the portal URL in case prior steps navigated away
+    try:
+        page.goto(portal_url, wait_until="networkidle")
+        time.sleep(2)
+    except Exception:
+        pass
     visited_urls.add(page.url)
 
     for step in range(MAX_NAV_STEPS):
@@ -1353,14 +1359,19 @@ Return ONLY valid JSON (no markdown):
 
         try:
             nav_response = _gemini_ask(nav_prompt)
-            nav_json = re.search(r'\{[\s\S]*\}', nav_response)
+            # Strip markdown code fences if Gemini wrapped the JSON
+            cleaned = nav_response
+            if "```" in cleaned:
+                cleaned = re.sub(r'```(?:json)?\s*', '', cleaned).strip()
+            print(f"    Navigator raw response: {cleaned[:200]}", flush=True)
+            nav_json = re.search(r'\{[\s\S]*\}', cleaned)
             if not nav_json:
-                print(f"  Navigator: Gemini returned unparseable response", flush=True)
-                break
+                print(f"  Navigator: Gemini returned unparseable response, continuing...", flush=True)
+                continue
             nav_action = _json.loads(nav_json.group())
         except Exception as e:
-            print(f"  Navigator: Gemini error: {e}", flush=True)
-            break
+            print(f"  Navigator: Gemini error: {e}, continuing...", flush=True)
+            continue
 
         action_type = nav_action.get("action", "none")
         target = nav_action.get("target", "")
