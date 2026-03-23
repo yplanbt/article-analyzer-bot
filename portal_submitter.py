@@ -49,7 +49,14 @@ def submit_to_portal(
     3. If use_ai_fallback=True and everything fails -> AI browser agent (costs ~$0.10)
     """
     import os
+    from urllib.parse import urlparse as _urlparse
     proxy_url = proxy or os.environ.get("US_PROXY", "")
+
+    # Skip proxy for .gov/.us/.mil domains — they don't need it and proxy causes failures
+    _domain = (_urlparse(portal_url).hostname or "").lower()
+    if proxy_url and any(_domain.endswith(s) for s in (".gov", ".us", ".mil")):
+        print(f"  Skipping proxy for government domain: {_domain}", flush=True)
+        proxy_url = ""
 
     headless_env = os.environ.get("BROWSER_HEADLESS", "").lower()
     if headless_env in ("false", "0", "no"):
@@ -786,10 +793,15 @@ def _submit_formcenter(page, url, body, subject, name, email, creds):
     time.sleep(3)  # FormCenter loads forms via JS, needs extra wait
 
     try:
-        # FormCenter renders forms dynamically — wait for form elements
-        page.wait_for_selector("form, .formContent, #FormCenter", timeout=10000)
+        # FormCenter renders forms dynamically — wait for form elements (increased from 10s)
+        page.wait_for_selector("form, .formContent, #FormCenter", timeout=15000)
         time.sleep(1)
+    except Exception:
+        # FormCenter layout not detected — fall back to generic handler
+        print(f"  FormCenter layout not detected, falling back to generic handler", flush=True)
+        return _submit_generic(page, url, body, subject, name, email)
 
+    try:
         # Step 1: Try label-based field matching (FormCenter's primary pattern)
         filled_any = _fill_by_labels(page, body, subject, name, email)
 

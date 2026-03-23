@@ -577,7 +577,7 @@ def run():
                     police_dept=dept,
                     portal_credentials=portal_creds,
                     anthropic_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-                    proxy=os.environ.get("US_PROXY", ""),
+                    proxy="",  # Proxy disabled by default — causes .gov failures
                 )
             except Exception as e:
                 result = {"success": False, "error": str(e)[:300]}
@@ -630,13 +630,57 @@ def run():
             is_system_error = any(kw in error.lower() for kw in SYSTEM_ERRORS)
 
             if is_system_error and portal_type != "justfoia":
-                # Non-JustFOIA system errors: retry next run
-                update_request_status(worksheet, row_idx,
-                                      status="Portal Needed",
-                                      notes=f"System error (will retry): {error[:150]}")
-                log_to_activity(client, "Portal System Error",
-                                f"{dept} — {suspect}: {error[:100]}")
-                print(f"  SYSTEM ERROR (will retry next run): {error}")
+                # Check how many times this row has already retried
+                existing_notes = str(data.get("Notes", ""))
+                retry_count = existing_notes.count("System error (will retry)")
+                if retry_count >= 3:
+                    # Too many retries — try email fallback
+                    print(f"  System error retry limit reached ({retry_count} prior). Trying email fallback...", flush=True)
+                    dept_email = _lookup_dept_email(client, dept, portal_url)
+                    foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
+                    foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
+                    if dept_email and foia_password:
+                        try:
+                            import smtplib
+                            import ssl
+                            from email.mime.text import MIMEText
+                            from email.mime.multipart import MIMEMultipart
+                            msg_obj = MIMEMultipart()
+                            msg_obj["From"] = foia_email
+                            msg_obj["To"] = dept_email
+                            msg_obj["Subject"] = subject
+                            msg_obj.attach(MIMEText(body, "plain"))
+                            ctx = ssl.create_default_context()
+                            with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                                server.starttls(context=ctx)
+                                server.login(foia_email, foia_password)
+                                server.sendmail(foia_email, dept_email, msg_obj.as_string())
+                            update_request_status(worksheet, row_idx,
+                                                  status="Sent",
+                                                  notes=f"Portal failed {retry_count+1}x — sent via email to {dept_email}",
+                                                  date_sent=today)
+                            log_to_activity(client, "Email Fallback Sent",
+                                            f"{dept} — {suspect}: emailed {dept_email} after {retry_count+1} portal failures")
+                            print(f"  EMAIL FALLBACK SUCCESS: Sent to {dept_email}")
+                            submitted += 1
+                            continue
+                        except Exception as email_err:
+                            print(f"  Email fallback failed: {email_err}")
+                    update_request_status(worksheet, row_idx,
+                                          status="Manual Needed",
+                                          notes=f"Portal failed {retry_count+1} times. Need manual submission: {error[:100]}")
+                    log_to_activity(client, "Portal Manual Needed",
+                                    f"{dept} — {suspect}: {retry_count+1} retries exhausted")
+                    print(f"  MANUAL NEEDED: Portal failed {retry_count+1} times")
+                    failed += 1
+                else:
+                    # Normal retry
+                    update_request_status(worksheet, row_idx,
+                                          status="Portal Needed",
+                                          notes=f"System error (will retry): {error[:150]}")
+                    log_to_activity(client, "Portal System Error",
+                                    f"{dept} — {suspect}: {error[:100]}")
+                    print(f"  SYSTEM ERROR (will retry next run): {error}")
             elif (result.get("needs_registration")
                   or "access restricted" in error.lower()
                   or "unable to connect" in error.lower()
@@ -686,6 +730,48 @@ def run():
                 log_to_activity(client, "Portal Manual Needed",
                                 f"{dept} — {suspect}: needs manual registration")
                 print(f"  MANUAL NEEDED: Portal restricted, no email fallback available")
+                failed += 1
+            elif ("no visible form" in error.lower()
+                  or "no form elements" in error.lower()
+                  or "0 visible form" in error.lower()):
+                # Info page — URL has no form, try email fallback
+                print(f"  Info page detected (no form). Trying email fallback...", flush=True)
+                dept_email = _lookup_dept_email(client, dept, portal_url)
+                foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
+                foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
+                if dept_email and foia_password:
+                    try:
+                        import smtplib
+                        import ssl
+                        from email.mime.text import MIMEText
+                        from email.mime.multipart import MIMEMultipart
+                        msg_obj = MIMEMultipart()
+                        msg_obj["From"] = foia_email
+                        msg_obj["To"] = dept_email
+                        msg_obj["Subject"] = subject
+                        msg_obj.attach(MIMEText(body, "plain"))
+                        ctx = ssl.create_default_context()
+                        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                            server.starttls(context=ctx)
+                            server.login(foia_email, foia_password)
+                            server.sendmail(foia_email, dept_email, msg_obj.as_string())
+                        update_request_status(worksheet, row_idx,
+                                              status="Sent",
+                                              notes=f"Info page (no form) — sent via email to {dept_email}",
+                                              date_sent=today)
+                        log_to_activity(client, "Email Fallback Sent",
+                                        f"{dept} — {suspect}: info page, emailed {dept_email}")
+                        print(f"  EMAIL FALLBACK SUCCESS: Sent to {dept_email}")
+                        submitted += 1
+                        continue
+                    except Exception as email_err:
+                        print(f"  Email fallback failed: {email_err}")
+                update_request_status(worksheet, row_idx,
+                                      status="Manual Needed",
+                                      notes=f"URL is info page (no form). Need email address: {error[:100]}")
+                log_to_activity(client, "Portal Manual Needed",
+                                f"{dept} — {suspect}: info page, no email")
+                print(f"  MANUAL NEEDED: Info page with no form, no email fallback")
                 failed += 1
             else:
                 update_request_status(worksheet, row_idx,
