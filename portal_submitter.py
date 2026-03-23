@@ -1634,47 +1634,87 @@ def _check_required_boxes(page):
 
 
 def _click_submit(page) -> bool:
-    """Try to find and click a submit button. Returns True if clicked."""
-    for selector in [
+    """Try to find and click a submit button. Returns True if the page changed after clicking.
+
+    Only clicks buttons that look like actual form submission buttons.
+    Verifies the page changed (URL or content) after clicking to confirm it worked.
+    """
+    url_before = page.url
+    content_before = page.text_content("body")[:500] if page.locator("body").count() > 0 else ""
+
+    # Ordered from most specific (real submit) to least specific
+    # Avoid generic buttons like Save/Continue/Next that might be navigation
+    submit_selectors = [
         "button[type='submit']",
-        "button:has-text('Submit')", "button:has-text('Send')",
-        "button:has-text('Create')", "button:has-text('File Request')",
         "input[type='submit']",
-        "a:has-text('Submit')", "a:has-text('Send Request')",
+        "button:has-text('Submit Request')", "button:has-text('Send Request')",
+        "button:has-text('File Request')",
+        "input[value*='Submit' i]", "input[value*='Send' i]",
+        "button.formSubmit", "input.formSubmit",
         ".submit-btn", "#submit", "#submit-request",
         "button[name*='submit' i]", "button[id*='submit' i]",
-        # FormCenter submit buttons
-        "button.formSubmit", "input.formSubmit",
-        "button:has-text('Submit Request')", "button:has-text('Send Request')",
-        # JustFOIA / Angular / React app buttons
-        "button:has-text('Save')", "button:has-text('Continue')",
-        "button:has-text('Next')", "button:has-text('Complete')",
-        "button.btn-primary", "button.btn-success",
-        "a.btn:has-text('Submit')", "a.btn-primary:has-text('Submit')",
-        # Any visible button that looks like submit
         "button[class*='submit' i]", "button[class*='send' i]",
-        "input[value*='Submit' i]", "input[value*='Send' i]",
-    ]:
+        "button:has-text('Submit')", "button:has-text('Send')",
+        "a:has-text('Submit Request')", "a:has-text('Send Request')",
+        "a.btn:has-text('Submit')",
+    ]
+    for selector in submit_selectors:
         try:
             el = page.locator(selector)
             if el.count() > 0 and el.first.is_visible():
+                print(f"    Clicking submit: {selector}", flush=True)
                 el.first.click()
-                time.sleep(2)
-                return True
+                time.sleep(3)
+
+                # Verify something changed — URL or page content
+                url_after = page.url
+                content_after = page.text_content("body")[:500] if page.locator("body").count() > 0 else ""
+                page_changed = (url_after != url_before) or (content_after != content_before)
+
+                if page_changed:
+                    print(f"    Page changed after submit click — likely successful", flush=True)
+                    return True
+                else:
+                    print(f"    Page did NOT change after clicking {selector} — may not have submitted", flush=True)
+                    # Don't return True — try next selector or return False
         except Exception:
             continue
     return False
 
 
 def _extract_confirmation(page) -> str:
-    """Try to extract a confirmation/tracking number from the current page."""
+    """Try to extract a confirmation/tracking number from the page after submission.
+
+    Only looks at visible text content (not HTML source) to avoid matching
+    random attributes or hidden elements.
+    """
     try:
-        page_text = page.content()
-        conf_match = re.search(
-            r'(?:request|confirmation|tracking|reference|case)\s*(?:#|number|id|no\.?)?\s*[:\s]*([A-Z0-9][\w-]{3,20})',
-            page_text, re.IGNORECASE
-        )
-        return conf_match.group(1) if conf_match else ""
+        visible_text = page.text_content("body") or ""
+        # Look for actual confirmation patterns in visible text
+        # Must have a number/ID that looks like a real tracking number (not random words)
+        conf_patterns = [
+            r'(?:confirmation|tracking|reference|case)\s*(?:#|number|id|no\.?)?\s*[:\s]+([A-Z0-9][\w-]{5,25})',
+            r'(?:request\s*(?:#|number|id))\s*[:\s]+([A-Z0-9][\w-]{5,25})',
+            r'(?:your\s+(?:request|case)\s+(?:number|id|#))\s*[:\s]+([A-Z0-9][\w-]{5,25})',
+            r'(?:R\d{5,}-\d{4,})',  # Common format: R012345-032026
+        ]
+        for pattern in conf_patterns:
+            conf_match = re.search(pattern, visible_text, re.IGNORECASE)
+            if conf_match:
+                result = conf_match.group(1) if conf_match.lastindex else conf_match.group(0)
+                print(f"    Confirmation number found: {result}", flush=True)
+                return result
+
+        # Check if the page shows a thank-you/success message
+        success_keywords = ["thank you", "has been submitted", "has been received",
+                           "successfully submitted", "request received", "we have received"]
+        text_lower = visible_text.lower()
+        for kw in success_keywords:
+            if kw in text_lower:
+                print(f"    Success message found on page: '{kw}'", flush=True)
+                return f"[success message: {kw}]"
+
+        return ""
     except Exception:
         return ""
 
