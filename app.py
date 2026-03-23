@@ -26,6 +26,7 @@ from foia_requester import (
     generate_request_id, send_email_smtp,
     draft_follow_up, get_requests_needing_followup,
     search_pd_contact_web, process_single_request,
+    check_bounced_emails,
 )
 from pd_database import (
     get_pd_database, lookup_department, add_department,
@@ -2148,6 +2149,28 @@ with tab_foia:
                     except Exception as e:
                         st.error(f"Failed: {e}")
                     st.rerun()
+
+            # Bounce check
+            if foia_email and foia_email_password:
+                if st.button("Check for Bounced Emails", type="secondary"):
+                    with st.spinner("Checking Gmail for bounce notifications..."):
+                        bounced = check_bounced_emails(foia_email, foia_email_password)
+                    if bounced:
+                        st.warning(f"Found {len(bounced)} bounced address(es): {', '.join(bounced)}")
+                        _bounced_count = 0
+                        for i, req in enumerate(all_requests):
+                            contact = req.get("Contact Info", "").strip().lower()
+                            if contact in bounced and req.get("Status") == "Sent":
+                                update_foia_row(service, foia_sheet_id, i + 2, {
+                                    "Status": "Bounced",
+                                    "Notes": f"Email bounced — {contact} is invalid",
+                                })
+                                _bounced_count += 1
+                        if _bounced_count:
+                            st.error(f"Marked {_bounced_count} request(s) as Bounced")
+                            st.rerun()
+                    else:
+                        st.success("No bounced emails found")
 
             # Request table
             df = pd.DataFrame(all_requests)

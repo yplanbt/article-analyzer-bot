@@ -482,6 +482,70 @@ def _verify_email_domain(email: str) -> bool:
         return False
 
 
+def _verify_mailbox(email_addr: str, timeout: int = 10) -> bool:
+    """Check if a specific mailbox exists via SMTP RCPT TO (no email sent).
+
+    Connects to the recipient's mail server and checks if the mailbox is valid.
+    Returns True if the server accepts the recipient, False if it rejects.
+    Returns True (optimistic) if the server doesn't support verification.
+    """
+    import socket
+    import subprocess
+    if not email_addr or "@" not in email_addr:
+        return False
+    domain = email_addr.split("@")[1].lower().strip()
+    logger.info("_verify_mailbox: checking %s", email_addr)
+
+    # Step 1: Get MX server for the domain
+    mx_host = None
+    try:
+        mx_result = subprocess.run(
+            ["dig", "+short", "MX", domain],
+            capture_output=True, text=True, timeout=5,
+        )
+        if mx_result.returncode == 0 and mx_result.stdout.strip():
+            # MX records format: "10 mail.example.com." — take lowest priority
+            mx_lines = [l.strip() for l in mx_result.stdout.strip().split("\n") if l.strip()]
+            mx_lines.sort(key=lambda x: int(x.split()[0]) if x.split()[0].isdigit() else 999)
+            if mx_lines:
+                mx_host = mx_lines[0].split()[-1].rstrip(".")
+    except Exception as e:
+        logger.debug("_verify_mailbox: MX lookup failed for %s: %s", domain, e)
+
+    if not mx_host:
+        logger.debug("_verify_mailbox: no MX found for %s — falling back to domain", domain)
+        mx_host = domain
+
+    # Step 2: Connect to MX server and try RCPT TO
+    try:
+        import smtplib
+        smtp = smtplib.SMTP(timeout=timeout)
+        smtp.connect(mx_host, 25)
+        smtp.ehlo("verify.local")
+        smtp.mail("")
+        code, msg = smtp.rcpt(email_addr)
+        smtp.quit()
+
+        if code == 250:
+            logger.info("_verify_mailbox: %s ACCEPTED (code %d)", email_addr, code)
+            return True
+        elif code in (550, 551, 552, 553, 554):
+            logger.warning("_verify_mailbox: %s REJECTED (code %d: %s)", email_addr, code, msg.decode(errors="replace"))
+            return False
+        else:
+            # Unknown response — assume valid (optimistic)
+            logger.info("_verify_mailbox: %s unknown response (code %d) — assuming valid", email_addr, code)
+            return True
+    except smtplib.SMTPServerDisconnected:
+        # Server disconnected — may block VRFY/RCPT. Assume valid.
+        logger.debug("_verify_mailbox: %s — server disconnected, assuming valid", email_addr)
+        return True
+    except (socket.timeout, socket.gaierror, OSError, smtplib.SMTPException) as e:
+        # Connection failed — can't verify. Assume valid (optimistic).
+        logger.debug("_verify_mailbox: %s — connection failed: %s, assuming valid", email_addr, e)
+        return True
+
+
 def _email_tld_confidence(email: str) -> str:
     """Return 'high', 'medium', or 'low' based on the email domain TLD.
 
@@ -776,11 +840,15 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
         result["suggested_emails"] = suggested_emails
 
         # Try to verify and promote a .gov/.us pattern email
+        # Check both domain (MX) AND mailbox (RCPT TO) to avoid sending to dead addresses
         verified_suggestion = None
         for candidate in suggested_emails:
             if _verify_email_domain(candidate) and _email_tld_confidence(candidate) == "high":
-                verified_suggestion = candidate
-                break
+                if _verify_mailbox(candidate):
+                    verified_suggestion = candidate
+                    break
+                else:
+                    logger.info("search_pd_contact_web: %s domain OK but mailbox rejected", candidate)
 
         if verified_suggestion:
             logger.info(
@@ -964,6 +1032,13 @@ def process_single_request(
     # Step 3: Send via best available method — always try email first (cheapest)
     # Even portal-only departments often accept email to their records custodian.
     # This saves $2-5/submission in Kevin's Opus tokens per avoided portal submission.
+
+    # Verify mailbox before sending — catch invalid addresses before wasting a send
+    if email_addr and not _verify_mailbox(email_addr):
+        logger.warning("process_single_request: mailbox verification FAILED for %s — skipping email", email_addr)
+        result["details"] = f"Email {email_addr} failed mailbox verification"
+        email_addr = ""  # Fall through to portal/draft path
+
     if email_addr:
         # Send via email (preferred — no browser automation, no vision API cost)
         send_result = send_email_smtp(
@@ -1149,6 +1224,58 @@ def send_email_smtp(
         return {"success": True, "message": f"Sent to {to_addr}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def check_bounced_emails(foia_email: str, foia_password: str) -> "list[str]":
+    """Check Gmail for bounced emails via IMAP. Returns list of bounced recipient addresses."""
+    import imaplib
+    import email as email_lib
+    import re
+
+    bounced_addrs = []
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(foia_email, foia_password)
+        mail.select("INBOX")
+
+        # Search for bounce notifications
+        _, msg_nums = mail.search(None, '(OR FROM "mailer-daemon" FROM "postmaster")')
+        if not msg_nums[0]:
+            mail.logout()
+            return []
+
+        for num in msg_nums[0].split():
+            _, data = mail.fetch(num, "(RFC822)")
+            if not data or not data[0]:
+                continue
+            raw = data[0][1]
+            msg = email_lib.message_from_bytes(raw)
+
+            # Extract bounced recipient from body
+            body_text = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body_text += part.get_payload(decode=True).decode(errors="replace")
+            else:
+                body_text = msg.get_payload(decode=True).decode(errors="replace")
+
+            # Common patterns in bounce messages
+            found = re.findall(r'(?:delivery.*?failed|undeliverable|rejected).*?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', body_text, re.IGNORECASE | re.DOTALL)
+            if not found:
+                # Try simpler: just find email addresses in the bounce
+                found = re.findall(r'<([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)>', body_text)
+                # Filter out our own email
+                found = [e for e in found if e.lower() != foia_email.lower()]
+
+            bounced_addrs.extend(found)
+
+        mail.logout()
+    except Exception as e:
+        logger.error("check_bounced_emails: %s", e)
+
+    # Deduplicate
+    return list(set(addr.lower() for addr in bounced_addrs))
 
 
 def get_requests_needing_followup(
