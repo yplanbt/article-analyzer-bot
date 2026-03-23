@@ -1009,7 +1009,7 @@ Rules:
     try:
         gemini_url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-2.0-flash:generateContent?key=" + gemini_key
+            "gemini-2.5-flash:generateContent?key=" + gemini_key
         )
         payload = _json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],

@@ -450,15 +450,32 @@ def _verify_url(url: str, max_redirects: int = 3, require_records_content: bool 
 
 
 def _verify_email_domain(email: str) -> bool:
-    """Check if the email domain exists by resolving its MX or A records."""
+    """Check if the email domain exists by resolving its MX records (preferred) or A records.
+
+    Uses proper MX lookup first — a domain with MX records is set up to receive email.
+    Falls back to A record only if MX lookup isn't available.
+    """
     if not email or "@" not in email:
         logger.debug("_verify_email_domain: invalid email format '%s'", email)
         return False
     domain = email.split("@")[1].lower().strip()
+    # Try MX lookup first (most reliable indicator of email capability)
+    try:
+        import subprocess
+        mx_result = subprocess.run(
+            ["dig", "+short", "MX", domain],
+            capture_output=True, text=True, timeout=5,
+        )
+        if mx_result.returncode == 0 and mx_result.stdout.strip():
+            logger.debug("_verify_email_domain: domain '%s' has MX records", domain)
+            return True
+    except Exception:
+        pass
+    # Fallback to A record resolution
     try:
         import socket
         socket.getaddrinfo(domain, 25, socket.AF_INET, socket.SOCK_STREAM)
-        logger.debug("_verify_email_domain: domain '%s' resolved successfully", domain)
+        logger.debug("_verify_email_domain: domain '%s' resolved via A record", domain)
         return True
     except (socket.gaierror, OSError) as exc:
         logger.debug("_verify_email_domain: domain '%s' did not resolve: %s", domain, exc)
@@ -483,13 +500,17 @@ def _email_tld_confidence(email: str) -> str:
 
 
 def _extract_city_slug(police_dept: str) -> str:
-    """Extract a city slug from a police department name for domain guessing."""
+    """Extract a city slug from a police department name for domain guessing.
+
+    Returns the locality name (city/town/county) stripped of department type.
+    """
     slug = police_dept.lower()
     for suffix in [
         "police department", "police dept", "police dept.", "pd",
         "sheriff's office", "sheriffs office", "sheriff office", "sheriff",
         "department of police", "dept of police",
         "metropolitan police", "city of", "town of",
+        "county", "parish",
     ]:
         slug = slug.replace(suffix, "")
     return slug.strip().replace(" ", "")
@@ -563,7 +584,12 @@ IMPORTANT:
 - Extract REAL email addresses visible in snippets; look for "name@domain.gov" patterns
 - Look at every URL in the results — if you see a .gov or .us domain pointing to a records/FOIA page, that is
   the department's official records page; extract the full URL
-- If you see a city/county domain (e.g. cityname.gov), also suggest likely records emails:
+- CRITICAL: Match the email domain to the SPECIFIC department being searched:
+  * If searching for "Bozeman Police Department", the email MUST be from bozeman.gov (city domain), NOT gallatinmt.gov (county domain)
+  * If searching for "Gallatin County Sheriff", the email should be from the COUNTY domain, NOT a city domain
+  * City police → city domain (e.g., cityname.gov). County sheriff → county domain (e.g., countyname.gov or countynamecounty.gov)
+  * NEVER use a county/state domain email for a city police department request, or vice versa
+- If you see a city/county domain (e.g. cityname.gov), suggest likely records emails ONLY if it matches the department:
   records@cityname.gov, foia@cityname.gov, publicrecords@cityname.gov
 - Distinguish between an official departmental portal URL (e.g. police.cityname.gov/records) and a generic
   vendor marketing page (e.g. nextrequest.com/about) — only report the former as the portal_url
@@ -658,26 +684,52 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
         else:
             logger.info("search_pd_contact_web: portal URL verified OK: %s", portal_url)
 
-    # Step 2c: Validate email — domain resolution + TLD confidence boost
+    # Step 2c: Validate email — domain resolution + TLD confidence + department match
     if result.get("email"):
         email = result["email"]
         tld_conf = _email_tld_confidence(email)
         logger.debug("search_pd_contact_web: email '%s' TLD confidence: %s", email, tld_conf)
-        if not _verify_email_domain(email):
-            logger.warning("search_pd_contact_web: email domain unresolvable for: %s", email)
-            if not result.get("notes"):
-                result["notes"] = ""
-            result["notes"] = (
-                result["notes"] + f" Email domain for {email} could not be verified via DNS."
-            ).strip()
-        else:
-            # Upgrade confidence if the email is on a .gov or .us domain
-            if tld_conf == "high" and result.get("confidence") in ("medium", "low"):
-                logger.info(
-                    "search_pd_contact_web: upgrading confidence to 'high' — .gov/.us email verified: %s", email
+
+        # Cross-check: does the email domain relate to the department?
+        email_domain = email.split("@")[1].lower() if "@" in email else ""
+        dept_lower = police_dept.lower()
+        is_county_dept = "county" in dept_lower or "parish" in dept_lower
+        # For city PDs, reject emails from county/state domains that don't contain city name
+        if city_slug and email_domain and not is_county_dept:
+            domain_has_city = city_slug in email_domain.replace(".", "")
+            if not domain_has_city and tld_conf == "high":
+                # .gov domain that doesn't match city name — likely wrong jurisdiction
+                logger.warning(
+                    "search_pd_contact_web: email domain '%s' does not contain city slug '%s' — "
+                    "possible wrong jurisdiction, downgrading to suggestion",
+                    email_domain, city_slug,
                 )
-                result["confidence"] = "high"
-            result.setdefault("email_tld_confidence", tld_conf)
+                if not result.get("notes"):
+                    result["notes"] = ""
+                result["notes"] = (
+                    result["notes"]
+                    + f" WARNING: {email} may be wrong jurisdiction (domain doesn't match {city_slug}). Verify manually."
+                ).strip()
+                result["confidence"] = "low"
+                result["email"] = ""  # Don't auto-send to wrong jurisdiction
+                result["method"] = "portal" if result.get("portal_url") else "unknown"
+
+        if result.get("email"):  # re-check — may have been cleared above
+            if not _verify_email_domain(email):
+                logger.warning("search_pd_contact_web: email domain unresolvable for: %s", email)
+                if not result.get("notes"):
+                    result["notes"] = ""
+                result["notes"] = (
+                    result["notes"] + f" Email domain for {email} could not be verified via DNS."
+                ).strip()
+            else:
+                # Upgrade confidence if the email is on a .gov or .us domain
+                if tld_conf == "high" and result.get("confidence") in ("medium", "low"):
+                    logger.info(
+                        "search_pd_contact_web: upgrading confidence to 'high' — .gov/.us email verified: %s", email
+                    )
+                    result["confidence"] = "high"
+                result.setdefault("email_tld_confidence", tld_conf)
 
     # Step 3: If no email found, ALWAYS run email-targeted second-round search
     # Email is preferred over portal (free vs $2-5/submission for Kevin's browser agent)
@@ -709,7 +761,9 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
 
     # Step 4: If still no email, try pattern-based emails with domain verification
     # .gov/.us domains require government registration — if MX resolves, it's legit
-    if not result.get("email") and result.get("confidence") != "high":
+    # Only try patterns for city PDs — county sheriff domains are too unpredictable
+    is_county = "county" in police_dept.lower() or "parish" in police_dept.lower()
+    if not result.get("email") and result.get("confidence") != "high" and not is_county:
         suggested_emails = [
             f"records@{city_slug}.gov",
             f"publicrecords@{city_slug}.gov",
@@ -835,7 +889,9 @@ def process_single_request(
 
     # Step 1b: If DB has portal but no email, try quick pattern verification
     # Email is free and instant; portal costs $2-5 via Kevin's browser agent
-    if pd_match and pd_match.get("Portal URL") and not pd_match.get("Email Address"):
+    # Skip for county/parish depts — domain patterns are unpredictable
+    is_county = "county" in dept_name.lower() or "parish" in dept_name.lower()
+    if pd_match and pd_match.get("Portal URL") and not pd_match.get("Email Address") and not is_county:
         city_slug = _extract_city_slug(dept_name)
         if city_slug:
             for candidate in [
@@ -1031,7 +1087,13 @@ def _guess_pd_email(police_dept: str, state: str) -> str:
 
     Tries multiple common .gov/.us patterns and returns the first one with
     a verified domain (DNS MX/A record resolves). Returns empty if none verify.
+    Skips county/parish departments — their domain patterns are too unpredictable.
     """
+    # County domains are unpredictable (e.g., gallatinmt.gov, gallatincountymt.gov)
+    if "county" in police_dept.lower() or "parish" in police_dept.lower():
+        logger.debug("_guess_pd_email: skipping pattern guess for county/parish dept: %s", police_dept)
+        return ""
+
     city = _extract_city_slug(police_dept)
     if not city:
         return ""
