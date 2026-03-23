@@ -967,7 +967,12 @@ def _ai_fill_form_dom(page, body, subject, name, email, police_dept, gemini_key)
     }""")
 
     if not form_elements or len(form_elements) < 2:
-        return {"success": False, "error": "No visible form elements found on page"}
+        return {"success": False, "error": f"Only {len(form_elements) if form_elements else 0} visible form elements found on page"}
+
+    # Log what we found so debug is easier
+    print(f"  DOM AI: found {len(form_elements)} form elements:", flush=True)
+    for i, fe in enumerate(form_elements[:10]):
+        print(f"    [{i}] <{fe['tag']} type={fe.get('type','')} name={fe.get('name','')} id={fe.get('id','')} label={fe.get('label','')[:40]}>", flush=True)
 
     # Step 2: Get page title and URL for context
     page_title = page.title()
@@ -1035,6 +1040,10 @@ Rules:
         return {"success": False, "error": f"AI API call failed: {str(e)[:200]}"}
 
     # Step 4: Execute each action
+    print(f"  Gemini returned {len(actions)} action(s):", flush=True)
+    for i, a in enumerate(actions):
+        print(f"    [{i}] {a.get('action','fill')} {a.get('selector','')} = {str(a.get('value',''))[:60]}", flush=True)
+
     filled_count = 0
     for action in actions:
         selector = action.get("selector", "")
@@ -1042,11 +1051,13 @@ Rules:
         act_type = action.get("action", "fill")
 
         if not selector or not value:
+            print(f"    SKIP: empty selector or value", flush=True)
             continue
 
         try:
             el = page.locator(selector).first
             if not el.is_visible():
+                print(f"    SKIP: {selector} not visible", flush=True)
                 continue
 
             if act_type == "select":
