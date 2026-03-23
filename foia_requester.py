@@ -434,8 +434,9 @@ def _verify_url(url: str, max_redirects: int = 3, require_records_content: bool 
             logger.debug(
                 "_verify_url: '%s' live but no records keywords found on page", url
             )
-            # Return True anyway — a live non-rejected page is still usable
-            return True
+            # No records keywords = not a real portal (probably city homepage)
+            logger.info("_verify_url: '%s' live but no records keywords — rejecting as portal", url)
+            return False
 
     except req.exceptions.Timeout:
         logger.warning("_verify_url: timeout verifying '%s'", url)
@@ -678,9 +679,10 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
                 result["confidence"] = "high"
             result.setdefault("email_tld_confidence", tld_conf)
 
-    # Step 3: If low confidence, retry with more targeted queries
-    if result.get("confidence") == "low" and not result.get("email") and not result.get("portal_url"):
-        logger.info("search_pd_contact_web: low confidence, running second-round queries")
+    # Step 3: If no email found, ALWAYS run email-targeted second-round search
+    # Email is preferred over portal (free vs $2-5/submission for Kevin's browser agent)
+    if not result.get("email"):
+        logger.info("search_pd_contact_web: no email found — running email-targeted second-round queries")
         alt_queries = [
             f'"{police_dept}" records department email "@"',
             f'{city_slug} {state} police department "records@" OR "foia@" OR "publicrecords@"',
@@ -690,39 +692,66 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
         if alt_snippets:
             combined_text = search_text + "\n" + "\n".join(alt_snippets[:12])
             retry_result = _analyze_search_results(police_dept, state, combined_text, anthropic_key)
-            if retry_result and (retry_result.get("email") or retry_result.get("portal_url")):
+            if retry_result and retry_result.get("email"):
+                # Only adopt retry if it found an email — that's the whole point
                 logger.info(
-                    "search_pd_contact_web: second-round search improved results — email=%s, portal=%s",
-                    retry_result.get("email", ""), retry_result.get("portal_url", ""),
+                    "search_pd_contact_web: second-round found email: %s",
+                    retry_result.get("email", ""),
                 )
+                # Preserve portal from original result as fallback
+                if not retry_result.get("portal_url") and result.get("portal_url"):
+                    retry_result["portal_url"] = result["portal_url"]
+                    retry_result["portal_type"] = result.get("portal_type", "")
                 retry_result["search_links"] = (all_links + alt_links)[:5]
                 result = retry_result
             else:
-                logger.info("search_pd_contact_web: second-round search did not improve results")
+                logger.info("search_pd_contact_web: second-round did not find email")
 
-    # Step 4: If still no concrete contact, generate pattern-based email suggestions
+    # Step 4: If still no email, try pattern-based emails with domain verification
+    # .gov/.us domains require government registration — if MX resolves, it's legit
     if not result.get("email") and result.get("confidence") != "high":
         suggested_emails = [
             f"records@{city_slug}.gov",
-            f"foia@{city_slug}.gov",
             f"publicrecords@{city_slug}.gov",
+            f"foia@{city_slug}.gov",
             f"openrecords@{city_slug}.gov",
             f"police@{city_slug}.gov",
             f"records@{city_slug}.us",
             f"foia@{city_slug}.us",
         ]
         result["suggested_emails"] = suggested_emails
-        logger.info(
-            "search_pd_contact_web: no confirmed email found — generated %d pattern suggestions",
-            len(suggested_emails),
-        )
-        if not result.get("notes"):
-            result["notes"] = ""
-        result["notes"] = (
-            result["notes"] + f" Suggested (unverified): {', '.join(suggested_emails[:3])}"
-        ).strip()
-        # Do NOT auto-use guessed emails — they are unverified and will bounce
-        result["confidence"] = "low"
+
+        # Try to verify and promote a .gov/.us pattern email
+        verified_suggestion = None
+        for candidate in suggested_emails:
+            if _verify_email_domain(candidate) and _email_tld_confidence(candidate) == "high":
+                verified_suggestion = candidate
+                break
+
+        if verified_suggestion:
+            logger.info(
+                "search_pd_contact_web: promoted verified .gov/.us pattern email: %s",
+                verified_suggestion,
+            )
+            result["email"] = verified_suggestion
+            result["method"] = "both" if result.get("portal_url") else "email"
+            result["confidence"] = "medium"
+            if not result.get("notes"):
+                result["notes"] = ""
+            result["notes"] = (
+                result["notes"] + f" Auto-verified pattern: {verified_suggestion}"
+            ).strip()
+        else:
+            logger.info(
+                "search_pd_contact_web: no pattern emails verified — %d suggestions in notes",
+                len(suggested_emails),
+            )
+            if not result.get("notes"):
+                result["notes"] = ""
+            result["notes"] = (
+                result["notes"] + f" Suggested (unverified): {', '.join(suggested_emails[:3])}"
+            ).strip()
+            result["confidence"] = "low"
 
     logger.info(
         "search_pd_contact_web: final result — method=%s, email=%s, portal=%s, confidence=%s",
@@ -803,6 +832,27 @@ def process_single_request(
 
     # Step 1: Find department contact
     pd_match = lookup_department(pd_db, dept_name, state)
+
+    # Step 1b: If DB has portal but no email, try quick pattern verification
+    # Email is free and instant; portal costs $2-5 via Kevin's browser agent
+    if pd_match and pd_match.get("Portal URL") and not pd_match.get("Email Address"):
+        city_slug = _extract_city_slug(dept_name)
+        if city_slug:
+            for candidate in [
+                f"records@{city_slug}.gov",
+                f"publicrecords@{city_slug}.gov",
+                f"foia@{city_slug}.gov",
+                f"records@{city_slug}.us",
+            ]:
+                if _verify_email_domain(candidate) and _email_tld_confidence(candidate) == "high":
+                    logger.info(
+                        "process_single_request: found verified email %s for portal-only dept %s",
+                        candidate, dept_name,
+                    )
+                    pd_match["Email Address"] = candidate
+                    pd_match["Method"] = "both"
+                    break
+
     if not pd_match or not (pd_match.get("Email Address") or pd_match.get("Portal URL")):
         # Auto-search for contact info
         contact_info = search_pd_contact_web(dept_name, state, serpapi_key, anthropic_key)
@@ -977,19 +1027,33 @@ def process_single_request(
 
 
 def _guess_pd_email(police_dept: str, state: str) -> str:
-    """Guess the most likely records request email for a police department."""
-    import re
-    # Extract city name from department name
-    name = police_dept.lower()
-    for suffix in ["police department", "police dept", "sheriff's office",
-                   "sheriff office", "sheriffs office", "department of police",
-                   "pd", "police", "sheriff"]:
-        name = name.replace(suffix, "")
-    city = name.strip().replace(" ", "")
+    """Guess the most likely records request email for a police department.
+
+    Tries multiple common .gov/.us patterns and returns the first one with
+    a verified domain (DNS MX/A record resolves). Returns empty if none verify.
+    """
+    city = _extract_city_slug(police_dept)
     if not city:
         return ""
-    # Most common pattern for US police records emails
-    return f"records@{city}pd.org"
+
+    # Ordered by likelihood — .gov is most common for government records
+    candidates = [
+        f"records@{city}.gov",
+        f"publicrecords@{city}.gov",
+        f"foia@{city}.gov",
+        f"records@{city}.us",
+        f"police@{city}.gov",
+        f"records@{city}pd.org",
+        f"records@{city}police.org",
+    ]
+    for email_candidate in candidates:
+        if _verify_email_domain(email_candidate):
+            tld_conf = _email_tld_confidence(email_candidate)
+            if tld_conf in ("high", "medium"):
+                logger.info("_guess_pd_email: verified pattern email: %s", email_candidate)
+                return email_candidate
+
+    return ""
 
 
 def generate_request_id() -> str:
@@ -1026,8 +1090,8 @@ def send_email_smtp(
 
 
 def get_requests_needing_followup(
-    requests: list[dict], sent_days: int = 10, progress_days: int = 14
-) -> list[dict]:
+    requests: "list[dict]", sent_days: int = 10, progress_days: int = 14
+) -> "list[dict]":
     """Find requests that need follow-up based on status and elapsed time."""
     today = date.today()
     needing = []
