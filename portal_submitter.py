@@ -1032,7 +1032,7 @@ Rules:
         )
         payload = _json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 800},
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024, "thinkingConfig": {"thinkingBudget": 0}},
         }).encode()
         req = urllib.request.Request(
             gemini_url,
@@ -1142,12 +1142,18 @@ def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police
         )
         payload = _json.dumps({
             "contents": [{"parts": [{"text": prompt_text}]}],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024},
+            # Disable thinking mode — it eats output tokens and truncates the JSON
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024, "thinkingConfig": {"thinkingBudget": 0}},
         }).encode()
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = _json.loads(resp.read().decode())
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Gemini may return multiple parts (thinking + response) — get the last text part
+        parts = data["candidates"][0]["content"]["parts"]
+        for part in reversed(parts):
+            if "text" in part:
+                return part["text"].strip()
+        return ""
 
     def _extract_page_links(pg):
         """Extract visible links and buttons from the page."""
