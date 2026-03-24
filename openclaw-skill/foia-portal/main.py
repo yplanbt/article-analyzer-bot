@@ -451,10 +451,12 @@ def _lookup_dept_email(client, dept_name, portal_url):
             ]
         # Also try portal domain for email (e.g., records@jaxsheriff.org)
         if query_domain:
+            # Strip www. prefix — records@www.example.org is never valid
+            email_domain = query_domain[4:] if query_domain.startswith("www.") else query_domain
             patterns.extend([
-                f"records@{query_domain}",
-                f"publicrecords@{query_domain}",
-                f"foia@{query_domain}",
+                f"records@{email_domain}",
+                f"publicrecords@{email_domain}",
+                f"foia@{email_domain}",
             ])
 
         old_timeout = socket.getdefaulttimeout()
