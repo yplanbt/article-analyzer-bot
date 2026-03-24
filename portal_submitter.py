@@ -54,6 +54,35 @@ def _gemini_request(gemini_key, prompt_text, max_retries=3):
     raise last_err  # All retries exhausted
 
 
+def _is_shell_page(form_elements: list) -> bool:
+    """Detect if visible form elements are all search-related (shell/wrapper page).
+
+    FormCenter and similar portals sometimes render a search shell instead of
+    the actual request form. These pages have inputs named 'search*', type='search',
+    or type='image' (search icon buttons) — but no real text/email/textarea fields.
+    """
+    if not form_elements:
+        return True
+    SEARCH_SIGNALS = {"search", "searchfield", "searchterm", "inputfcsearch", "inputfcterm"}
+    for el in form_elements:
+        name_lower = (el.get("name") or "").lower()
+        id_lower = (el.get("id") or "").lower()
+        el_type = (el.get("type") or "").lower()
+        label_lower = (el.get("label") or "").lower()
+        # Skip elements that look search-related
+        if (el_type in ("search", "image")
+                or name_lower in SEARCH_SIGNALS or id_lower in SEARCH_SIGNALS
+                or "search" in name_lower or "search" in id_lower
+                or label_lower in ("search", "enter search terms")):
+            continue
+        # Found a non-search element (text input, textarea, email, select, etc.)
+        if el.get("tag") in ("textarea", "select"):
+            return False
+        if el_type in ("text", "email", "tel", "url", "number", "date", ""):
+            return False
+    return True
+
+
 def detect_portal_type(url: str) -> str:
     """Detect the portal type from the URL."""
     url_lower = url.lower()
@@ -857,6 +886,31 @@ def _submit_formcenter(page, url, body, subject, name, email, creds):
         print(f"  FormCenter layout not detected, falling back to generic handler", flush=True)
         return _submit_generic(page, url, body, subject, name, email)
 
+    # Shell-page detection: check if visible form elements are all search-related
+    shell_elements = page.evaluate("""() => {
+        const els = document.querySelectorAll('input, textarea, select');
+        return Array.from(els).map(el => {
+            const rect = el.getBoundingClientRect();
+            return {
+                tag: el.tagName.toLowerCase(),
+                type: el.type || '',
+                name: el.name || '',
+                id: el.id || '',
+                label: (el.labels && el.labels[0]) ? el.labels[0].textContent.trim() : '',
+                visible: rect.width > 0 && rect.height > 0
+            };
+        }).filter(e => e.visible);
+    }""")
+    if _is_shell_page(shell_elements):
+        print(f"  FormCenter shell page detected — only search inputs visible, no real form fields", flush=True)
+        return {
+            "success": False,
+            "error": "Shell page: FormCenter URL only exposes search inputs, no request form fields",
+            "portal_type": "unknown",  # allows Tier 2 / email fallback
+            "needs_manual": True,
+            "page_url": page.url,
+        }
+
     try:
         # Step 1: Try label-based field matching (FormCenter's primary pattern)
         filled_any = _fill_by_labels(page, body, subject, name, email)
@@ -1024,6 +1078,11 @@ def _ai_fill_form_dom(page, body, subject, name, email, police_dept, gemini_key)
 
     if not form_elements or len(form_elements) < 2:
         return {"success": False, "error": f"Only {len(form_elements) if form_elements else 0} visible form elements found on page"}
+
+    # Shell-page detection: bail early if all elements are search-related
+    if _is_shell_page(form_elements):
+        print(f"  DOM AI: shell page detected — {len(form_elements)} elements are all search-related, skipping Gemini", flush=True)
+        return {"success": False, "error": f"Shell page: {len(form_elements)} visible elements are all search inputs, no real form fields"}
 
     # Log what we found so debug is easier
     print(f"  DOM AI: found {len(form_elements)} form elements:", flush=True)
@@ -1303,6 +1362,21 @@ def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police
         current_url = page.url
         form_count = _count_form_fields(page)
         print(f"  Navigator step {step + 1}/{MAX_NAV_STEPS}: {current_url} ({form_count} form fields)", flush=True)
+
+        # Check for shell page before treating this as a real form
+        if form_count >= 1:
+            nav_elements = page.evaluate("""() => {
+                const els = document.querySelectorAll('input, textarea, select');
+                return Array.from(els).map(el => {
+                    const rect = el.getBoundingClientRect();
+                    return {tag: el.tagName.toLowerCase(), type: el.type || '', name: el.name || '',
+                            id: el.id || '', label: (el.labels && el.labels[0]) ? el.labels[0].textContent.trim() : '',
+                            visible: rect.width > 0 && rect.height > 0};
+                }).filter(e => e.visible);
+            }""")
+            if _is_shell_page(nav_elements):
+                print(f"  Navigator: shell page at {current_url} — {len(nav_elements)} search-only elements, skipping form fill", flush=True)
+                form_count = 0  # treat as no-form page so navigator explores elsewhere
 
         # Found a form with enough fields — try to fill and submit
         if form_count >= 3:

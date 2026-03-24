@@ -782,7 +782,8 @@ def run():
                   or "0 visible form" in error.lower()
                   or "could not find/submit" in error.lower()
                   or "navigator explored" in error.lower()
-                  or "none could be filled" in error.lower()):
+                  or "none could be filled" in error.lower()
+                  or "shell page" in error.lower()):
                 # No usable form found — try email fallback
                 print(f"  Info page detected (no form). Trying email fallback...", flush=True)
                 dept_email = _lookup_dept_email(client, dept, portal_url)
