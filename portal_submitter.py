@@ -9,7 +9,49 @@ Run `playwright install chromium` once to set up.
 import os
 import re
 import time
+import random
 from datetime import datetime
+
+
+def _gemini_request(gemini_key, prompt_text, max_retries=3):
+    """Send a prompt to Gemini Flash with retry logic for transient errors."""
+    import urllib.request
+    import json as _json
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash:generateContent?key=" + gemini_key
+    )
+    payload = _json.dumps({
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 1024, "thinkingConfig": {"thinkingBudget": 0}},
+    }).encode()
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = _json.loads(resp.read().decode())
+            candidates = data.get("candidates", [])
+            if not candidates or "content" not in candidates[0]:
+                return ""
+            parts = candidates[0]["content"].get("parts", [])
+            for part in reversed(parts):
+                if "text" in part:
+                    return part["text"].strip()
+            return ""
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            # Retry on rate limit (429), server errors (5xx), timeouts
+            if any(kw in err_str for kw in ("429", "500", "502", "503", "timeout", "urlopen")):
+                wait = min(2 ** attempt + random.uniform(0, 1), 15)
+                print(f"  Gemini retry {attempt + 1}/{max_retries}: {e} — waiting {wait:.1f}s", flush=True)
+                time.sleep(wait)
+            else:
+                raise  # Non-retryable error (auth, bad request, etc.)
+    raise last_err  # All retries exhausted
 
 
 def detect_portal_type(url: str) -> str:
@@ -490,7 +532,7 @@ def _register_justfoia(page, base_url, name, email):
         return {"success": False, "error": f"Registration error: {str(e)}"}
 
 
-def _check_verification_email(email_addr, email_password, sender_pattern="justfoia", timeout=90):
+def _check_verification_email(email_addr, email_password, sender_pattern="justfoia", timeout=300):
     """Check Gmail IMAP for a JustFOIA verification email and extract the link.
 
     Returns the verification URL or None.
@@ -1026,29 +1068,9 @@ Rules:
 - Return ONLY the JSON array, no other text"""
 
     try:
-        gemini_url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-2.5-flash:generateContent?key=" + gemini_key
-        )
-        payload = _json.dumps({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024, "thinkingConfig": {"thinkingBudget": 0}},
-        }).encode()
-        req = urllib.request.Request(
-            gemini_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp_data = _json.loads(resp.read().decode())
-
-        candidates = resp_data.get("candidates", [])
-        if not candidates or "content" not in candidates[0]:
+        raw = _gemini_request(gemini_key, prompt)
+        if not raw:
             return {"success": False, "error": "Gemini returned empty response"}
-        parts = candidates[0]["content"].get("parts", [])
-        if not parts or "text" not in parts[0]:
-            return {"success": False, "error": "Gemini returned no text"}
-        raw = parts[0]["text"].strip()
 
         # Parse JSON from response
         json_match = re.search(r'\[[\s\S]*\]', raw)
@@ -1141,27 +1163,8 @@ def _ai_navigate_and_submit(page, portal_url, body, subject, name, email, police
     cred_password = (creds or {}).get("password", "F0ia2024!Req")
 
     def _gemini_ask(prompt_text):
-        """Send a text prompt to Gemini and return the response text."""
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-2.5-flash:generateContent?key=" + gemini_key
-        )
-        payload = _json.dumps({
-            "contents": [{"parts": [{"text": prompt_text}]}],
-            # Disable thinking mode — it eats output tokens and truncates the JSON
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024, "thinkingConfig": {"thinkingBudget": 0}},
-        }).encode()
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = _json.loads(resp.read().decode())
-        candidates = data.get("candidates", [])
-        if not candidates or "content" not in candidates[0]:
-            return ""
-        parts = candidates[0]["content"].get("parts", [])
-        for part in reversed(parts):
-            if "text" in part:
-                return part["text"].strip()
-        return ""
+        """Send a text prompt to Gemini and return the response text (with retry)."""
+        return _gemini_request(gemini_key, prompt_text)
 
     def _extract_page_links(pg):
         """Extract visible links and buttons from the page."""
@@ -1666,11 +1669,18 @@ def _click_submit(page) -> bool:
         "a:has-text('Submit Request')", "a:has-text('Send Request')",
         "a.btn:has-text('Submit')",
     ]
+    # Words that indicate a button is NOT a form submit
+    skip_words = {"feedback", "cancel", "back", "save draft", "login", "sign in", "search", "reset"}
+
     for selector in submit_selectors:
         try:
             el = page.locator(selector)
             if el.count() > 0 and el.first.is_visible():
-                print(f"    Clicking submit: {selector}", flush=True)
+                btn_text = (el.first.text_content() or "").strip().lower()
+                if any(sw in btn_text for sw in skip_words):
+                    print(f"    Skipping non-submit button: '{btn_text}' ({selector})", flush=True)
+                    continue
+                print(f"    Clicking submit: {selector} ('{btn_text}')", flush=True)
                 el.first.click()
                 time.sleep(3)
 

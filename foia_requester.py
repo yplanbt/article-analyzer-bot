@@ -775,14 +775,17 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
         email_domain = email.split("@")[1].lower() if "@" in email else ""
         dept_lower = police_dept.lower()
         is_county_dept = "county" in dept_lower or "parish" in dept_lower
-        # For city PDs, reject emails from county/state domains that don't contain city name
+        # For city PDs, warn about emails from domains that don't contain city name
+        # but DON'T discard — state/county .gov emails are often valid for city PDs
         if city_slug and email_domain and not is_county_dept:
             domain_has_city = city_slug in email_domain.replace(".", "")
-            if not domain_has_city and tld_conf == "high":
-                # .gov domain that doesn't match city name — likely wrong jurisdiction
+            state_slug = state.lower().replace(" ", "") if state else ""
+            domain_has_state = state_slug and state_slug in email_domain.replace(".", "")
+            if not domain_has_city and not domain_has_state and tld_conf == "high":
+                # .gov domain that matches neither city nor state — likely wrong jurisdiction
                 logger.warning(
-                    "search_pd_contact_web: email domain '%s' does not contain city slug '%s' — "
-                    "possible wrong jurisdiction, downgrading to suggestion",
+                    "search_pd_contact_web: email domain '%s' does not contain city slug '%s' or state — "
+                    "possible wrong jurisdiction, downgrading confidence",
                     email_domain, city_slug,
                 )
                 if not result.get("notes"):
@@ -792,8 +795,8 @@ def search_pd_contact_web(police_dept: str, state: str, serpapi_key: str, anthro
                     + f" WARNING: {email} may be wrong jurisdiction (domain doesn't match {city_slug}). Verify manually."
                 ).strip()
                 result["confidence"] = "low"
-                result["email"] = ""  # Don't auto-send to wrong jurisdiction
-                result["method"] = "portal" if result.get("portal_url") else "unknown"
+                # Keep the email — don't discard. Low confidence will flag for review but still allow sending.
+                # result["email"] = ""  # REMOVED: was causing valid state-level emails to be lost
 
         if result.get("email"):  # re-check — may have been cleared above
             if not _verify_email_domain(email):
@@ -1051,11 +1054,13 @@ def process_single_request(
     # This saves $2-5/submission in Kevin's Opus tokens per avoided portal submission.
 
     # Verify mailbox before sending — catch invalid addresses before wasting a send
+    failed_email = ""
     if email_addr and not _verify_mailbox(email_addr):
-        logger.warning("process_single_request: mailbox verification FAILED for %s — skipping email", email_addr)
-        result["details"] = f"Email {email_addr} failed mailbox verification"
+        logger.warning("process_single_request: mailbox verification FAILED for %s — trying portal fallback", email_addr)
+        failed_email = email_addr
         email_addr = ""  # Fall through to portal/draft path
 
+    email_sent = False
     if email_addr:
         # Send via email (preferred — no browser automation, no vision API cost)
         send_result = send_email_smtp(
@@ -1091,12 +1096,19 @@ def process_single_request(
             result["details"] = f"Emailed to {email_addr}"
             result["method"] = "email"
             result["letter"] = letter
+            email_sent = True
             time.sleep(1)  # Rate limit between emails
         else:
-            result["status"] = "failed"
-            result["details"] = f"Email failed: {send_result['error']}"
-    elif portal_url and not email_addr:
-        # Queue for Kevin (OpenClaw) — he has AI browser agent + CAPTCHA solver
+            # SMTP failed — remember the failure and try portal fallback
+            logger.warning("process_single_request: SMTP send failed for %s: %s — trying portal fallback",
+                           email_addr, send_result.get("error", "unknown"))
+            failed_email = email_addr
+
+    # Portal fallback — try if email was never available, verification failed, or SMTP failed
+    if not email_sent and portal_url:
+        notes = f"Queued for Kevin. Portal: {portal_url}"
+        if failed_email:
+            notes += f" (email {failed_email} failed — using portal instead)"
         from sheets_client import write_foia_request
         write_foia_request(service, foia_sheet_id, {
             "Request ID": generate_request_id(),
@@ -1113,19 +1125,24 @@ def process_single_request(
             "Date Sent": "",
             "Last Follow-Up": "",
             "Follow-Up Count": "0",
-            "Notes": f"Queued for Kevin. Portal: {portal_url}",
+            "Notes": notes,
             "Request Body": letter["body"],
         })
         result["status"] = "portal_draft"
         result["details"] = f"Portal request queued for Kevin. URL: {portal_url}"
+        if failed_email:
+            result["details"] += f" (email {failed_email} failed)"
         result["method"] = "portal"
         result["portal_url"] = portal_url
         result["letter"] = letter
-    else:
+    elif not email_sent:
         # No verified contact found — save as Draft for manual review
         guessed_email = _guess_pd_email(dept_name, state)
         if guessed_email:
             from sheets_client import write_foia_request
+            draft_notes = "UNVERIFIED — guessed email, needs manual review before sending"
+            if failed_email:
+                draft_notes += f" (original email {failed_email} failed verification)"
             write_foia_request(service, foia_sheet_id, {
                 "Request ID": generate_request_id(),
                 "Article URL": article["url"],
@@ -1141,7 +1158,7 @@ def process_single_request(
                 "Date Sent": "",
                 "Last Follow-Up": "",
                 "Follow-Up Count": "0",
-                "Notes": f"UNVERIFIED — guessed email, needs manual review before sending",
+                "Notes": draft_notes,
                 "Request Body": letter["body"],
             })
             result["status"] = "draft"

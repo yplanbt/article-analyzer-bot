@@ -71,6 +71,11 @@ REQUESTER_EMAIL = CONFIG["requester_email"]
 REQUESTER_NAME = CONFIG["requester_name"]
 SA_KEY_PATH = os.path.expanduser(CONFIG["sa_key_path"])
 
+# FOIA email credentials — must be for the SAME Gmail account
+# Priority: env var > skill.json config > requester_email fallback
+FOIA_EMAIL = os.environ.get("FOIA_EMAIL") or CONFIG.get("foia_email") or REQUESTER_EMAIL
+FOIA_EMAIL_PASSWORD = os.environ.get("FOIA_EMAIL_PASSWORD") or CONFIG.get("foia_email_password") or ""
+
 # Propagate Gemini key from skill config if not in env
 if "GEMINI_API_KEY" not in os.environ:
     _gemini_key = CONFIG.get("gemini_api_key", "")
@@ -554,9 +559,7 @@ def run():
         if portal_type == "justfoia":
             dept_email = _lookup_dept_email(client, dept, portal_url)
             if dept_email:
-                foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
-                foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
-                if foia_password:
+                if FOIA_EMAIL_PASSWORD:
                     print(f"  JustFOIA portal — sending via email instead: {dept_email}")
                     try:
                         import smtplib
@@ -565,7 +568,7 @@ def run():
                         from email.mime.multipart import MIMEMultipart
 
                         msg = MIMEMultipart()
-                        msg["From"] = foia_email
+                        msg["From"] = FOIA_EMAIL
                         msg["To"] = dept_email
                         msg["Subject"] = subject
                         msg.attach(MIMEText(body, "plain"))
@@ -573,8 +576,8 @@ def run():
                         ctx = ssl.create_default_context()
                         with smtplib.SMTP("smtp.gmail.com", 587) as server:
                             server.starttls(context=ctx)
-                            server.login(foia_email, foia_password)
-                            server.sendmail(foia_email, dept_email, msg.as_string())
+                            server.login(FOIA_EMAIL, FOIA_EMAIL_PASSWORD)
+                            server.sendmail(FOIA_EMAIL, dept_email, msg.as_string())
 
                         update_request_status(worksheet, row_idx,
                                               status="Sent",
@@ -662,11 +665,18 @@ def run():
             ai_fallback = result.get("ai_fallback_error", "")
             fallback_note = f" | AI fallback: {ai_fallback[:100]}" if ai_fallback else ""
 
-            # System errors keep "Portal Needed" so they auto-retry next run
-            SYSTEM_ERRORS = ["playwright", "not installed", "network", "timeout",
-                             "connection", "dns", "proxy", "econnrefused",
-                             "chromium", "browser", "errno"]
-            is_system_error = any(kw in error.lower() for kw in SYSTEM_ERRORS)
+            # System errors keep "Portal Needed" so they auto-retry next run.
+            # Be specific to avoid misclassifying auth/form errors as retryable.
+            SYSTEM_ERRORS = ["playwright", "not installed", "network timeout",
+                             "connection refused", "connection reset", "dns",
+                             "econnrefused", "econnreset", "chromium",
+                             "browser closed", "browser not", "errno"]
+            # Auth/form errors should NOT be retried even if they contain "connection"
+            NON_SYSTEM = ["authentication", "auth failed", "login failed",
+                          "invalid credentials", "permission denied", "403", "401"]
+            error_lower = error.lower()
+            is_system_error = (any(kw in error_lower for kw in SYSTEM_ERRORS)
+                               and not any(kw in error_lower for kw in NON_SYSTEM))
 
             if is_system_error and portal_type != "justfoia":
                 # Check how many times this row has already retried
@@ -676,24 +686,22 @@ def run():
                     # Too many retries — try email fallback
                     print(f"  System error retry limit reached ({retry_count} prior). Trying email fallback...", flush=True)
                     dept_email = _lookup_dept_email(client, dept, portal_url)
-                    foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
-                    foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
-                    if dept_email and foia_password:
+                    if dept_email and FOIA_EMAIL_PASSWORD:
                         try:
                             import smtplib
                             import ssl
                             from email.mime.text import MIMEText
                             from email.mime.multipart import MIMEMultipart
                             msg_obj = MIMEMultipart()
-                            msg_obj["From"] = foia_email
+                            msg_obj["From"] = FOIA_EMAIL
                             msg_obj["To"] = dept_email
                             msg_obj["Subject"] = subject
                             msg_obj.attach(MIMEText(body, "plain"))
                             ctx = ssl.create_default_context()
                             with smtplib.SMTP("smtp.gmail.com", 587) as server:
                                 server.starttls(context=ctx)
-                                server.login(foia_email, foia_password)
-                                server.sendmail(foia_email, dept_email, msg_obj.as_string())
+                                server.login(FOIA_EMAIL, FOIA_EMAIL_PASSWORD)
+                                server.sendmail(FOIA_EMAIL, dept_email, msg_obj.as_string())
                             update_request_status(worksheet, row_idx,
                                                   status="Sent",
                                                   notes=f"Portal failed {retry_count+1}x — sent via email to {dept_email}",
@@ -727,10 +735,9 @@ def run():
                 # Portal is locked — try sending via email as fallback
                 # Look up department email from PD Database
                 dept_email = _lookup_dept_email(client, dept, portal_url)
-                foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
-                foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
+                # Use global FOIA_EMAIL / FOIA_EMAIL_PASSWORD constants
 
-                if dept_email and foia_password:
+                if dept_email and FOIA_EMAIL_PASSWORD:
                     print(f"  Portal restricted — falling back to email: {dept_email}")
                     try:
                         import smtplib
@@ -739,7 +746,7 @@ def run():
                         from email.mime.multipart import MIMEMultipart
 
                         msg = MIMEMultipart()
-                        msg["From"] = foia_email
+                        msg["From"] = FOIA_EMAIL
                         msg["To"] = dept_email
                         msg["Subject"] = subject
                         msg.attach(MIMEText(body, "plain"))
@@ -747,8 +754,8 @@ def run():
                         ctx = ssl.create_default_context()
                         with smtplib.SMTP("smtp.gmail.com", 587) as server:
                             server.starttls(context=ctx)
-                            server.login(foia_email, foia_password)
-                            server.sendmail(foia_email, dept_email, msg.as_string())
+                            server.login(FOIA_EMAIL, FOIA_EMAIL_PASSWORD)
+                            server.sendmail(FOIA_EMAIL, dept_email, msg.as_string())
 
                         update_request_status(worksheet, row_idx,
                                               status="Sent",
@@ -779,24 +786,23 @@ def run():
                 # No usable form found — try email fallback
                 print(f"  Info page detected (no form). Trying email fallback...", flush=True)
                 dept_email = _lookup_dept_email(client, dept, portal_url)
-                foia_email = os.environ.get("FOIA_EMAIL", REQUESTER_EMAIL)
-                foia_password = os.environ.get("FOIA_EMAIL_PASSWORD", "")
-                if dept_email and foia_password:
+                # Use global FOIA_EMAIL / FOIA_EMAIL_PASSWORD constants
+                if dept_email and FOIA_EMAIL_PASSWORD:
                     try:
                         import smtplib
                         import ssl
                         from email.mime.text import MIMEText
                         from email.mime.multipart import MIMEMultipart
                         msg_obj = MIMEMultipart()
-                        msg_obj["From"] = foia_email
+                        msg_obj["From"] = FOIA_EMAIL
                         msg_obj["To"] = dept_email
                         msg_obj["Subject"] = subject
                         msg_obj.attach(MIMEText(body, "plain"))
                         ctx = ssl.create_default_context()
                         with smtplib.SMTP("smtp.gmail.com", 587) as server:
                             server.starttls(context=ctx)
-                            server.login(foia_email, foia_password)
-                            server.sendmail(foia_email, dept_email, msg_obj.as_string())
+                            server.login(FOIA_EMAIL, FOIA_EMAIL_PASSWORD)
+                            server.sendmail(FOIA_EMAIL, dept_email, msg_obj.as_string())
                         update_request_status(worksheet, row_idx,
                                               status="Sent",
                                               notes=f"Info page (no form) — sent via email to {dept_email}",
